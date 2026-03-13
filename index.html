@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PGA Tournament Simulator v2</title>
+<title>PGA Tournament Simulator v3</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
@@ -21,21 +21,24 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const {useState,useEffect,useCallback,useMemo}=React;
+const {useState,useEffect,useCallback,useMemo,useRef}=React;
 const SENSITIVITY=4;
 const DG_BASE="https://feeds.datagolf.com";
+const WEATHER_KEY="f9747827ca9b4e7aa0b175947261303";
+const DG_KEY_HIST="c741a29a2fdc66f8ff76ea573847";
 const SIM_COUNTS=[1000,5000,10000,25000,50000];
 const MARKETS=["win","top_5","top_10","top_20","make_cut"];
 const MARKET_LABELS={win:"Win",top_5:"Top 5",top_10:"Top 10",top_20:"Top 20",make_cut:"Make Cut"};
-const ROUND_STDEV=2.8;
-const KNOWN_BOOKS=["draftkings"];
-const MAX_STORE=15000;
+const ROUND_STDEV=2.8;const KNOWN_BOOKS=["draftkings"];const MAX_STORE=15000;
 const PROXIES=[
   {name:"corsproxy.io",fn:u=>"https://corsproxy.io/?"+encodeURIComponent(u)},
   {name:"allorigins",fn:u=>"https://api.allorigins.win/raw?url="+encodeURIComponent(u)},
   {name:"corsproxy.org",fn:u=>"https://corsproxy.org/?"+encodeURIComponent(u)},
   {name:"Direct",fn:u=>u},
 ];
+const COURSE_SIM_COLS=["par","yardage","adj_score_to_par","adj_driving_distance","adj_driving_accuracy","putt_sg","arg_sg","app_sg","ott_sg","fw_width","miss_fw_pen_frac","adj_gir","less_150_sg","greater_150_sg","adj_penalties"];
+
+/* ── helpers ── */
 const normalRandom=()=>{let u=0,v=0;while(!u)u=Math.random();while(!v)v=Math.random();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);};
 const decToImp=o=>(o&&o>1)?1/o:0;
 const pFmt=v=>v!=null?(v*100).toFixed(2)+"%":"-";
@@ -43,30 +46,54 @@ const pFmtS=v=>v!=null?(v*100).toFixed(1)+"%":"-";
 const evFmt=v=>{if(v==null)return"-";const s=(v*100).toFixed(1);return v>0?"+"+s+"%":s+"%";};
 const ci95=(p,n)=>n>0?1.96*Math.sqrt(Math.max(0,p*(1-p))/n):0;
 const kellyBet=(sp,dec,frac,br)=>{if(!dec||dec<=1||sp<=0)return 0;const b=dec-1,q=1-sp,f=(b*sp-q)/b;return f>0?f*frac*br:0;};
-const downloadCSV=(rows,fname)=>{
-  if(!rows.length)return;
-  const hdrs=Object.keys(rows[0]);
-  const csv=[hdrs.join(","),...rows.map(r=>hdrs.map(h=>{const v=r[h];return typeof v==="string"&&v.includes(",")?"\""+v+"\"":v??""}).join(","))].join("\n");
-  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download=fname;a.click();
+const downloadCSV=(rows,fname)=>{if(!rows.length)return;const hdrs=Object.keys(rows[0]);const csv=[hdrs.join(","),...rows.map(r=>hdrs.map(h=>{const v=r[h];return typeof v==="string"&&v.includes(",")?"\""+v+"\"":v??""}).join(","))].join("\n");const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download=fname;a.click();};
+const sGet=k=>{try{const v=localStorage.getItem("pga3_"+k);return v?JSON.parse(v):null;}catch{return null;}};
+const sSet=(k,v)=>{try{localStorage.setItem("pga3_"+k,JSON.stringify(v));}catch{}};
+
+/* ── CSV parser ── */
+const parseCSV=(text)=>{
+  const lines=text.split(/\r?\n/).filter(l=>l.trim());if(lines.length<2)return[];
+  const hdr=lines[0].split(",").map(h=>h.replace(/"/g,"").trim());
+  return lines.slice(1).map(line=>{
+    const vals=[];let cur="",inQ=false;
+    for(let i=0;i<line.length;i++){const c=line[i];if(c==='"'){inQ=!inQ;}else if(c===","&&!inQ){vals.push(cur);cur="";}else{cur+=c;}}
+    vals.push(cur);const obj={};hdr.forEach((h,i)=>{const v=vals[i]?.trim();obj[h]=isNaN(v)||v===""?v:parseFloat(v);});return obj;
+  });
 };
-const sGet=k=>{try{const v=localStorage.getItem("pga2_"+k);return v?JSON.parse(v):null;}catch{return null;}};
-const sSet=(k,v)=>{try{localStorage.setItem("pga2_"+k,JSON.stringify(v));}catch{}};
+
+/* ── course similarity ── */
+const cosineSim=(a,b)=>{let dot=0,ma=0,mb=0;for(let i=0;i<a.length;i++){dot+=a[i]*b[i];ma+=a[i]*a[i];mb+=b[i]*b[i];}return(ma&&mb)?dot/(Math.sqrt(ma)*Math.sqrt(mb)):0;};
+const buildCourseVecs=(courses)=>{
+  const mins={},maxs={};COURSE_SIM_COLS.forEach(c=>{mins[c]=Infinity;maxs[c]=-Infinity;});
+  courses.forEach(cr=>{COURSE_SIM_COLS.forEach(c=>{const v=cr[c];if(typeof v==="number"&&!isNaN(v)){mins[c]=Math.min(mins[c],v);maxs[c]=Math.max(maxs[c],v);}});});
+  return courses.map(cr=>({course:cr.course,vec:COURSE_SIM_COLS.map(c=>{const v=cr[c],mn=mins[c],mx=maxs[c];return(typeof v==="number"&&mx>mn)?(v-mn)/(mx-mn):0;}),data:cr}));
+};
+const findSimilarCourses=(name,vecs,n=10)=>{
+  const target=vecs.find(v=>v.course?.toLowerCase()===name?.toLowerCase());if(!target)return[];
+  return vecs.filter(v=>v.course!==target.course).map(v=>({...v,sim:cosineSim(target.vec,v.vec)})).sort((a,b)=>b.sim-a.sim).slice(0,n);
+};
+const fuzzyMatch=(name,courses)=>{
+  if(!name||!courses.length)return null;const nl=name.toLowerCase().replace(/[^a-z0-9]/g,"");
+  let best=null,bestS=0;courses.forEach(c=>{const cl=(c.course||"").toLowerCase().replace(/[^a-z0-9]/g,"");let s=0;if(cl===nl)s=1;else if(cl.includes(nl)||nl.includes(cl))s=0.9;else{let m=0;for(let i=0;i<Math.min(cl.length,nl.length);i++)if(cl[i]===nl[i])m++;s=m/Math.max(cl.length,nl.length);}if(s>bestS){bestS=s;best=c;}});
+  return bestS>0.4?best:null;
+};
+
+/* ── correlation ── */
+const pearsonCorr=(x,y)=>{const n=x.length;if(n<3)return 0;const mx=x.reduce((a,b)=>a+b,0)/n,my=y.reduce((a,b)=>a+b,0)/n;let num=0,dx=0,dy=0;for(let i=0;i<n;i++){const a=x[i]-mx,b=y[i]-my;num+=a*b;dx+=a*a;dy+=b*b;}return(dx&&dy)?num/Math.sqrt(dx*dy):0;};
+const rankArray=(arr)=>{const idx=arr.map((v,i)=>({v,i})).sort((a,b)=>a.v-b.v);const ranks=new Array(arr.length);for(let i=0;i<idx.length;){let j=i;while(j<idx.length&&idx[j].v===idx[i].v)j++;const avg=(i+j+1)/2;for(let k=i;k<j;k++)ranks[idx[k].i]=avg;i=j;}return ranks;};
+const spearmanCorr=(x,y)=>pearsonCorr(rankArray(x),rankArray(y));
+
+/* ── DataGolf fetch ── */
 const dgFetch=async(path,params,pi)=>{
-  const url=new URL(DG_BASE+path);
-  Object.entries(params).forEach(([k,v])=>url.searchParams.set(k,v));
-  url.searchParams.set("file_format","json");
+  const url=new URL(DG_BASE+path);Object.entries(params).forEach(([k,v])=>url.searchParams.set(k,v));url.searchParams.set("file_format","json");
   const raw=url.toString(),proxied=PROXIES[pi]?.fn(raw)||raw;
-  const ctrl=new AbortController();const t=setTimeout(()=>ctrl.abort(),12000);
+  const ctrl=new AbortController();const t=setTimeout(()=>ctrl.abort(),15000);
   try{const r=await fetch(proxied,{signal:ctrl.signal,headers:{Accept:"application/json"}});clearTimeout(t);if(!r.ok)throw new Error(r.status);const d=await r.json();return d?.contents?JSON.parse(d.contents):d;}
   catch(e){clearTimeout(t);throw e;}
 };
-const findArr=d=>{
-  if(Array.isArray(d))return d;
-  if(typeof d!=="object"||!d)return null;
-  for(const k of Object.keys(d)){if(Array.isArray(d[k])&&d[k].length>0&&typeof d[k][0]==="object")return d[k];}
-  const v=Object.values(d);if(v.length>5&&v.every(x=>typeof x==="object"&&x&&!Array.isArray(x)))return v;
-  return null;
-};
+const findArr=d=>{if(Array.isArray(d))return d;if(typeof d!=="object"||!d)return null;for(const k of Object.keys(d)){if(Array.isArray(d[k])&&d[k].length>0&&typeof d[k][0]==="object")return d[k];}const v=Object.values(d);if(v.length>5&&v.every(x=>typeof x==="object"&&x&&!Array.isArray(x)))return v;return null;};
+
+/* ── simulation engine ── */
 const runSim=(players,weights,n)=>{
   if(!players.length)return{results:[],allScores:null};
   const st=weights.sg_dist+weights.sg_acc+weights.sg_app+weights.sg_arg+weights.sg_putt;
@@ -76,32 +103,31 @@ const runSim=(players,weights,n)=>{
     const eqSG=(p.sg_dist+p.sg_acc+p.sg_app+p.sg_arg+p.sg_putt)*0.2;
     const delta=(userSG-eqSG)*SENSITIVITY;
     const base=(p.baseline||0)+delta;
-    return base+(p.course_history_adj||0)*weights.course_history+(p.course_fit_adj||0)*weights.course_fit+(p.recent_form_adj||0)*weights.recent_form;
+    return base+(p.course_history_adj||0)*weights.course_history+(p.course_fit_adj||0)*weights.course_fit+(p.recent_form_adj||0)*weights.recent_form+(p.similar_course_adj||0)*weights.similar_course;
   });
   const res=players.map(()=>({w:0,t5:0,t10:0,t20:0,mc:0,tp:0}));
   const store=n<=MAX_STORE;const allScores=store?[]:null;
   for(let s=0;s<n;s++){
     const sc=skills.map(sk=>{let t=0;for(let r=0;r<4;r++)t+=-(sk+normalRandom()*ROUND_STDEV);return t;});
     if(store)allScores.push(new Float32Array(sc));
-    const ix=sc.map((v,i)=>({v,i})).sort((a,b)=>a.v-b.v);
-    let pos=1;
+    const ix=sc.map((v,i)=>({v,i})).sort((a,b)=>a.v-b.v);let pos=1;
     for(let j=0;j<ix.length;){let k=j;while(k<ix.length&&Math.abs(ix[k].v-ix[j].v)<.001)k++;const avg=(pos+pos+k-j-1)/2;for(let m=j;m<k;m++){const pi=ix[m].i;res[pi].tp+=avg;if(avg<=1)res[pi].w++;if(avg<=5)res[pi].t5++;if(avg<=10)res[pi].t10++;if(avg<=20)res[pi].t20++;if(avg<=65)res[pi].mc++;}pos+=k-j;j=k;}
   }
-  const results=players.map((p,i)=>({...p,sim_win:res[i].w/n,sim_top5:res[i].t5/n,sim_top10:res[i].t10/n,sim_top20:res[i].t20/n,sim_make_cut:res[i].mc/n,avg_finish:res[i].tp/n}));
-  return{results,allScores};
+  return{results:players.map((p,i)=>({...p,sim_win:res[i].w/n,sim_top5:res[i].t5/n,sim_top10:res[i].t10/n,sim_top20:res[i].t20/n,sim_make_cut:res[i].mc/n,avg_finish:res[i].tp/n})),allScores};
 };
-const computeH2H=(allScores,players,pairs)=>{
-  const idxMap={};players.forEach((p,i)=>idxMap[p.id]=i);
-  const n=allScores.length,h2h={};
-  for(const pair of pairs){
-    const i=idxMap[pair.id1],j=idxMap[pair.id2];
-    if(i==null||j==null)continue;
-    let iW=0;for(let s=0;s<n;s++){if(allScores[s][i]<allScores[s][j])iW++;}
-    h2h[pair.id1+"_"+pair.id2]=iW/n;h2h[pair.id2+"_"+pair.id1]=1-iW/n;
-  }
-  return h2h;
-};
+const computeH2H=(allScores,players,pairs)=>{const idxMap={};players.forEach((p,i)=>idxMap[p.id]=i);const n=allScores.length,h2h={};for(const pair of pairs){const i=idxMap[pair.id1],j=idxMap[pair.id2];if(i==null||j==null)continue;let iW=0;for(let s=0;s<n;s++){if(allScores[s][i]<allScores[s][j])iW++;}h2h[pair.id1+"_"+pair.id2]=iW/n;h2h[pair.id2+"_"+pair.id1]=1-iW/n;}return h2h;};
 
+/* ── CorrBar component ── */
+function CorrBar({val,label,color}){
+  const pct=Math.abs(val)*100;
+  return <div style={{marginBottom:8}}>
+    <div style={{display:"flex",justifyContent:"space-between",fontSize:10,marginBottom:3}}><span style={{color:"#cbd5e1",fontWeight:600}}>{label}</span><span style={{color:val<-0.1?"#22c55e":val>0.1?"#ef4444":"#94a3b8",fontWeight:700}}>{val.toFixed(3)}</span></div>
+    <div style={{height:10,background:"#1e293b",borderRadius:5,overflow:"hidden"}}><div style={{width:Math.min(pct*2,100)+"%",height:"100%",background:color||(val<0?"#22c55e":"#ef4444"),borderRadius:5}}/></div>
+    <div style={{fontSize:8,color:"#475569",marginTop:1}}>{val<-0.2?"Strong predictor":val<-0.1?"Moderate predictor":val>0.1?"Inverse":"Weak"}</div>
+  </div>;
+}
+
+/* ══════════ MAIN APP ══════════ */
 function App(){
   const [tab,setTab]=useState("setup");
   const [apiKey,setApiKey]=useState("");const [apiKeyInp,setApiKeyInp]=useState("");
@@ -109,7 +135,7 @@ function App(){
   const [ds,setDs]=useState({decomp:null,preds:null,skills:null,odds:{},matchupPairs:[]});
   const [tourney,setTourney]=useState(null);const [players,setPlayers]=useState([]);
   const [sgW,setSgW]=useState({dist:15,acc:15,app:30,arg:20,putt:20});
-  const [ctxW,setCtxW]=useState({ch:100,cf:100,rf:100});
+  const [ctxW,setCtxW]=useState({ch:100,cf:100,rf:100,sc:100});
   const [simCount,setSimCount_]=useState(10000);
   const [simRes,setSimRes]=useState(null);const [allScores,setAllScores]=useState(null);
   const [h2hData,setH2hData]=useState(null);const [simRunning,setSimRunning]=useState(false);
@@ -119,31 +145,32 @@ function App(){
   const [expanded,setExpanded]=useState(null);
   const [bankroll,setBankroll]=useState(1000);const [kellyFrac,setKellyFrac]=useState(0.5);
   const [compareItems,setCompareItems]=useState([]);const [showCompare,setShowCompare]=useState(false);
+  /* Course state */
+  const [courseCSV,setCourseCSV]=useState(null);const [courseMatch,setCourseMatch]=useState(null);const [courseMatchManual,setCourseMatchManual]=useState("");
+  const [similarCourses,setSimilarCourses]=useState([]);
+  const [courseHistLoading,setCourseHistLoading]=useState(false);const [courseHistStatus,setCourseHistStatus]=useState("");
+  const [courseCorr,setCourseCorr]=useState(null);const [simCourseCorr,setSimCourseCorr]=useState(null);
+  const [playerSimCoursePerf,setPlayerSimCoursePerf]=useState(null);const [fieldComp,setFieldComp]=useState(null);
+  const [weatherData,setWeatherData]=useState(null);const [weatherLoading,setWeatherLoading]=useState(false);
+  const [courseHistEventId,setCourseHistEventId]=useState("");const [courseHistYear,setCourseHistYear]=useState("2025");
+  /* Grading state */
+  const [gradingSim,setGradingSim]=useState(null);const [gradeEventId,setGradeEventId]=useState("");const [gradeYear,setGradeYear]=useState("2025");
+  const [gradeLoading,setGradeLoading]=useState(false);const [gradeStatus,setGradeStatus]=useState("");
+  const [gradeResults,setGradeResults]=useState(null);const [gradeCorr,setGradeCorr]=useState(null);
+  const [eventList,setEventList]=useState(null);const [eventListLoading,setEventListLoading]=useState(false);
 
-  useEffect(()=>{
-    const k=sGet("dg_key");if(k){setApiKey(k);setApiKeyInp(k);}
-    const p=sGet("presets");if(p)setPresets(p);const h=sGet("hist");if(h)setHist(h);
-    const sg=sGet("sgW");if(sg)setSgW(sg);const cx=sGet("ctxW");if(cx)setCtxW(cx);
-    const b=sGet("bankroll");if(b)setBankroll(b);const kf=sGet("kf");if(kf!=null)setKellyFrac(kf);
-  },[]);
-  useEffect(()=>{sSet("sgW",sgW);},[sgW]);
-  useEffect(()=>{sSet("ctxW",ctxW);},[ctxW]);
-  useEffect(()=>{sSet("bankroll",bankroll);},[bankroll]);
-  useEffect(()=>{sSet("kf",kellyFrac);},[kellyFrac]);
+  useEffect(()=>{const k=sGet("dg_key");if(k){setApiKey(k);setApiKeyInp(k);}const p=sGet("presets");if(p)setPresets(p);const h=sGet("hist");if(h)setHist(h);const sg=sGet("sgW");if(sg)setSgW(sg);const cx=sGet("ctxW");if(cx)setCtxW(prev=>({...prev,...cx}));const b=sGet("bankroll");if(b)setBankroll(b);const kf=sGet("kf");if(kf!=null)setKellyFrac(kf);const csv=sGet("courseCSV");if(csv)setCourseCSV(csv);},[]);
+  useEffect(()=>{sSet("sgW",sgW);},[sgW]);useEffect(()=>{sSet("ctxW",ctxW);},[ctxW]);
+  useEffect(()=>{sSet("bankroll",bankroll);},[bankroll]);useEffect(()=>{sSet("kf",kellyFrac);},[kellyFrac]);
+
+  useEffect(()=>{if(!courseCSV||!tourney?.course)return;const m=fuzzyMatch(tourney.course,courseCSV);if(m){setCourseMatch(m);setCourseMatchManual(m.course);const vecs=buildCourseVecs(courseCSV);setSimilarCourses(findSimilarCourses(m.course,vecs,10));}},[courseCSV,tourney]);
+
+  useEffect(()=>{if(!players.length)return;const cats=[{k:"sg_dist",l:"Driving Distance"},{k:"sg_acc",l:"Driving Accuracy"},{k:"sg_app",l:"Approach"},{k:"sg_arg",l:"Around Green"},{k:"sg_putt",l:"Putting"}];
+    setFieldComp(cats.map(c=>{const vals=players.map(p=>p[c.k]||0).sort((a,b)=>a-b);const avg=vals.reduce((a,b)=>a+b,0)/vals.length;const std=Math.sqrt(vals.reduce((a,v)=>a+(v-avg)**2,0)/vals.length);return{...c,avg,std,min:vals[0],max:vals[vals.length-1],spread:vals[vals.length-1]-vals[0]};}));
+  },[players]);
 
   const saveKey=()=>{const k=apiKeyInp.trim();setApiKey(k);sSet("dg_key",k);setError(null);};
-
-  const parseMatchupPairs=(ma)=>{
-    const pairs=[];
-    (findArr(ma)||[]).forEach(m=>{
-      const id1=m.p1_dg_id||m.player1_dg_id||null,id2=m.p2_dg_id||m.player2_dg_id||null;
-      const n1=m.player1||m.p1_player_name||"",n2=m.player2||m.p2_player_name||"";
-      let dk1=0,dk2=0;
-      Object.entries(m).forEach(([k,v])=>{if(typeof v!=="number")return;const kl=k.toLowerCase().replace(/[\s_]/g,"");if(KNOWN_BOOKS.some(b=>kl.includes(b))){if(kl.includes("p1")||kl.includes("player1"))dk1=Math.max(dk1,v);if(kl.includes("p2")||kl.includes("player2"))dk2=Math.max(dk2,v);}});
-      if(id1&&id2)pairs.push({id1,id2,name1:n1||String(id1),name2:n2||String(id2),dk1,dk2});
-    });
-    return pairs;
-  };
+  const parseMatchupPairs=(ma)=>{const pairs=[];(findArr(ma)||[]).forEach(m=>{const id1=m.p1_dg_id||m.player1_dg_id||null,id2=m.p2_dg_id||m.player2_dg_id||null;const n1=m.player1||m.p1_player_name||"",n2=m.player2||m.p2_player_name||"";let dk1=0,dk2=0;Object.entries(m).forEach(([k,v])=>{if(typeof v!=="number")return;const kl=k.toLowerCase().replace(/[\s_]/g,"");if(KNOWN_BOOKS.some(b=>kl.includes(b))){if(kl.includes("p1")||kl.includes("player1"))dk1=Math.max(dk1,v);if(kl.includes("p2")||kl.includes("player2"))dk2=Math.max(dk2,v);}});if(id1&&id2)pairs.push({id1,id2,name1:n1||String(id1),name2:n2||String(id2),dk1,dk2});});return pairs;};
 
   const mergeAll=useCallback((decomp,preds,skills,odds,mp,ti)=>{
     const da=findArr(decomp)||[],pa=findArr(preds)||[],sa=findArr(skills)||[];
@@ -152,453 +179,340 @@ function App(){
     const om={};Object.entries(odds||{}).forEach(([mkt,d])=>{om[mkt]={};(findArr(d)||[]).forEach(p=>{const k=p.dg_id||p.player_name;if(k)om[mkt][k]=p;});});
     const src=da.length?da:pa.length?pa:[];
     const merged=src.map(p=>{
-      const id=p.dg_id||p.player_name;if(!id)return null;
-      const sk=sm[id]||{},pr=pm[id]||{};
+      const id=p.dg_id||p.player_name;if(!id)return null;const sk=sm[id]||{},pr=pm[id]||{};
       const sg_dist=p.driving_distance_adjustment||0,sg_acc=p.driving_accuracy_adjustment||0;
-      const sg_app=p.cf_approach_comp??p.approach??sk.sg_app??0;
-      const sg_arg=p.cf_short_comp??p.around_the_green??sk.sg_arg??0;
-      const sg_putt=p.putting_adjustment??p.putting??sk.sg_putt??0;
-      const ch=p.course_history_adjustment||p.course_experience_adjustment||0;
-      const cf=p.total_fit_adjustment||0,rf=p.true_sg_adjustments||0;
+      const sg_app=p.cf_approach_comp??p.approach??sk.sg_app??0,sg_arg=p.cf_short_comp??p.around_the_green??sk.sg_arg??0,sg_putt=p.putting_adjustment??p.putting??sk.sg_putt??0;
+      const ch=p.course_history_adjustment||p.course_experience_adjustment||0,cf=p.total_fit_adjustment||0,rf=p.true_sg_adjustments||0;
       const playerOdds={};
-      MARKETS.forEach(mkt=>{
-        const od=om[mkt]?.[id];if(!od)return;
-        let best=0,bBook="";
-        Object.entries(od).forEach(([k,v])=>{if(typeof v==="number"&&v>1&&KNOWN_BOOKS.some(b=>k.toLowerCase().replace(/[\s_]/g,"").includes(b))){if(v>best){best=v;bBook=k;}}});
-        if(best>1)playerOdds[mkt]={bestOdds:best,bestBook:bBook,dgProb:od.dg_prob||od.datagolf_base_history_fit||0};
-      });
-      return{id,name:p.player_name||p.name||String(id),country:p.country||"",sg_dist,sg_acc,sg_app,sg_arg,sg_putt,baseline:p.baseline_pred||0,course_history_adj:ch,course_fit_adj:cf,recent_form_adj:rf,dg_win:pr.win||0,dg_top5:pr.top_5||0,dg_top10:pr.top_10||0,dg_top20:pr.top_20||0,dg_make_cut:pr.make_cut||0,playerOdds};
+      MARKETS.forEach(mkt=>{const od=om[mkt]?.[id];if(!od)return;let best=0,bBook="";Object.entries(od).forEach(([k,v])=>{if(typeof v==="number"&&v>1&&KNOWN_BOOKS.some(b=>k.toLowerCase().replace(/[\s_]/g,"").includes(b))){if(v>best){best=v;bBook=k;}}});if(best>1)playerOdds[mkt]={bestOdds:best,bestBook:bBook,dgProb:od.dg_prob||od.datagolf_base_history_fit||0};});
+      return{id,name:p.player_name||p.name||String(id),country:p.country||"",sg_dist,sg_acc,sg_app,sg_arg,sg_putt,baseline:p.baseline_pred||0,course_history_adj:ch,course_fit_adj:cf,recent_form_adj:rf,similar_course_adj:0,dg_win:pr.win||0,dg_top5:pr.top_5||0,dg_top10:pr.top_10||0,dg_top20:pr.top_20||0,dg_make_cut:pr.make_cut||0,playerOdds};
     }).filter(p=>p&&(Math.abs(p.baseline)>0.001||p.dg_win>0||Math.abs(p.sg_dist+p.sg_acc+p.sg_app+p.sg_arg+p.sg_putt)>0.001));
     setPlayers(merged);setDs(d=>({...d,matchupPairs:mp||[]}));if(ti)setTourney(ti);setH2hData(null);
   },[]);
 
   const fetchAll=async(pi=0)=>{
-    if(!apiKey){setError("Save API key first.");return;}
-    setLoading(true);setError(null);setFetchSt("Trying "+PROXIES[pi]?.name+"...");
+    if(!apiKey){setError("Save API key first.");return;}setLoading(true);setError(null);setFetchSt("Trying "+PROXIES[pi]?.name+"...");
     const f=(path,par)=>dgFetch(path,par,pi),par={key:apiKey,tour:"pga"};
     try{
       setFetchSt("["+PROXIES[pi]?.name+"] Field...");const field=await f("/field-updates",par);
-      const ti={name:field?.event_name||"Tournament",course:field?.course||""};
+      const ti={name:field?.event_name||"Tournament",course:field?.course||"",city:field?.city||field?.location||""};
       setFetchSt("["+PROXIES[pi]?.name+"] Decompositions...");const decomp=await f("/preds/player-decompositions",par);
       setFetchSt("["+PROXIES[pi]?.name+"] Predictions...");const preds=await f("/preds/pre-tournament",{...par,odds_format:"percent"});
       setFetchSt("["+PROXIES[pi]?.name+"] Skills...");const skills=await f("/preds/skill-ratings",{...par,display:"value"});
       setFetchSt("["+PROXIES[pi]?.name+"] Odds...");const odds={};
       await Promise.all(MARKETS.map(async m=>{try{odds[m]=await f("/betting-tools/outrights",{...par,market:m,odds_format:"decimal"});}catch{}}));
-      setFetchSt("["+PROXIES[pi]?.name+"] Matchups...");let mu=[];
-      try{mu=await f("/betting-tools/matchups",{...par,market:"tournament_matchups",odds_format:"decimal"});}catch{}
-      setDs({decomp,preds,skills,odds,matchupPairs:[]});mergeAll(decomp,preds,skills,odds,parseMatchupPairs(mu),ti);
-      setFetchSt("");setTab("weights");
-    }catch(e){if(pi<PROXIES.length-1){setLoading(false);return fetchAll(pi+1);}setError("All proxies failed. Use Quick Import below.");setFetchSt("");}
-    setLoading(false);
+      setFetchSt("["+PROXIES[pi]?.name+"] Matchups...");let mu=[];try{mu=await f("/betting-tools/matchups",{...par,market:"tournament_matchups",odds_format:"decimal"});}catch{}
+      setDs({decomp,preds,skills,odds,matchupPairs:[]});mergeAll(decomp,preds,skills,odds,parseMatchupPairs(mu),ti);setFetchSt("");setTab("course");
+    }catch(e){if(pi<PROXIES.length-1){setLoading(false);return fetchAll(pi+1);}setError("All proxies failed. Use Quick Import.");setFetchSt("");}setLoading(false);
   };
 
   const handleImport=(text)=>{
-    try{
-      const raw=JSON.parse(text.trim());const arr=findArr(raw);const meta=!Array.isArray(raw)&&typeof raw==="object"?raw:{};
-      if(!arr||!arr.length)return{ok:false,msg:"No array found."};
-      const s=arr[0];let type,label;
+    try{const raw=JSON.parse(text.trim());const arr=findArr(raw);const meta=!Array.isArray(raw)&&typeof raw==="object"?raw:{};
+      if(!arr||!arr.length)return{ok:false,msg:"No array found."};const s=arr[0];let type,label;
       if(s.baseline_pred!==undefined||s.driving_accuracy_adjustment!==undefined||s.cf_approach_comp!==undefined||s.total_fit_adjustment!==undefined){type="decomp";label="Decompositions ("+arr.length+")";}
       else if(s.win!==undefined&&s.make_cut!==undefined&&s.baseline_pred===undefined&&s.dg_prob===undefined){type="preds";label="Predictions ("+arr.length+")";}
       else if(s.sg_total!==undefined||(s.sg_ott!==undefined&&s.baseline_pred===undefined)){type="skills";label="Skill Ratings ("+arr.length+")";}
       else if(s.dg_prob!==undefined||Object.keys(s).some(k=>KNOWN_BOOKS.some(b=>k.toLowerCase().includes(b)))){type="odds";label="Odds ("+arr.length+")";}
       else if(s.p1_player_name!==undefined||s.player1!==undefined||s.p1_dg_id!==undefined){type="matchups";label="Matchups ("+arr.length+")";}
       else if(s.player_name||s.dg_id){type="decomp";label="Player data ("+arr.length+")";}
-      else return{ok:false,msg:"Unknown format. Fields: "+Object.keys(s).slice(0,8).join(", ")};
-      const nds={...ds};const ti={name:meta.event_name||tourney?.name||"Imported",course:meta.course||tourney?.course||""};
-      let mp=ds.matchupPairs||[];
-      if(type==="decomp")nds.decomp=arr;else if(type==="preds")nds.preds=arr;
-      else if(type==="skills")nds.skills=arr;
-      else if(type==="odds"){nds.odds={...nds.odds,[meta.market||"win"]:arr};}
-      else if(type==="matchups"){mp=parseMatchupPairs(arr);}
-      setDs(nds);mergeAll(nds.decomp,nds.preds,nds.skills,nds.odds,mp,ti);
-      return{ok:true,msg:"✓ "+label,type};
+      else return{ok:false,msg:"Unknown format."};
+      const nds={...ds};const ti={name:meta.event_name||tourney?.name||"Imported",course:meta.course||tourney?.course||"",city:meta.city||tourney?.city||""};let mp=ds.matchupPairs||[];
+      if(type==="decomp")nds.decomp=arr;else if(type==="preds")nds.preds=arr;else if(type==="skills")nds.skills=arr;else if(type==="odds"){nds.odds={...nds.odds,[meta.market||"win"]:arr};}else if(type==="matchups"){mp=parseMatchupPairs(arr);}
+      setDs(nds);mergeAll(nds.decomp,nds.preds,nds.skills,nds.odds,mp,ti);return{ok:true,msg:"✓ "+label,type};
     }catch(e){return{ok:false,msg:"Invalid JSON: "+e.message};}
   };
 
-  const adjSG=(field,val)=>{
-    const c={...sgW};const old=c[field];const diff=val-old;
-    const oth=Object.keys(c).filter(k=>k!==field);const othSum=oth.reduce((s,k)=>s+c[k],0);
-    if(othSum===0){c[field]=Math.min(100,Math.max(0,val));}
-    else{c[field]=val;oth.forEach(k=>{c[k]=Math.max(0,Math.round(c[k]-diff*(c[k]/othSum)));});
-    const tot=Object.values(c).reduce((s,v)=>s+v,0);if(tot!==100){const lg=oth.sort((a,b)=>c[b]-c[a])[0];c[lg]+=100-tot;}}
-    setSgW(c);
-  };
+  const adjSG=(field,val)=>{const c={...sgW};const old=c[field];const diff=val-old;const oth=Object.keys(c).filter(k=>k!==field);const othSum=oth.reduce((s,k)=>s+c[k],0);if(othSum===0){c[field]=Math.min(100,Math.max(0,val));}else{c[field]=val;oth.forEach(k=>{c[k]=Math.max(0,Math.round(c[k]-diff*(c[k]/othSum)));});const tot=Object.values(c).reduce((s,v)=>s+v,0);if(tot!==100){const lg=oth.sort((a,b)=>c[b]-c[a])[0];c[lg]+=100-tot;}}setSgW(c);};
 
   const doSim=useCallback(async()=>{
-    if(!players.length)return;
-    setSimRunning(true);await new Promise(r=>setTimeout(r,50));
-    const w={sg_dist:sgW.dist/100,sg_acc:sgW.acc/100,sg_app:sgW.app/100,sg_arg:sgW.arg/100,sg_putt:sgW.putt/100,course_history:ctxW.ch/100,course_fit:ctxW.cf/100,recent_form:ctxW.rf/100};
-    const {results,allScores:scores}=runSim(players,w,simCount);
-    setSimRes(results);setAllScores(scores);
-    if(scores&&ds.matchupPairs.length>0)setH2hData(computeH2H(scores,players,ds.matchupPairs.slice(0,300)));
-    else setH2hData(null);
+    if(!players.length)return;setSimRunning(true);await new Promise(r=>setTimeout(r,50));
+    const w={sg_dist:sgW.dist/100,sg_acc:sgW.acc/100,sg_app:sgW.app/100,sg_arg:sgW.arg/100,sg_putt:sgW.putt/100,course_history:ctxW.ch/100,course_fit:ctxW.cf/100,recent_form:ctxW.rf/100,similar_course:ctxW.sc/100};
+    const {results,allScores:scores}=runSim(players,w,simCount);setSimRes(results);setAllScores(scores);
+    if(scores&&ds.matchupPairs.length>0)setH2hData(computeH2H(scores,players,ds.matchupPairs.slice(0,300)));else setH2hData(null);
     setSimRunning(false);setTab("results");
     const e={id:Date.now(),date:new Date().toISOString(),t:tourney?.name,n:simCount,sg:{...sgW},cx:{...ctxW},top30:results.slice().sort((a,b)=>b.sim_win-a.sim_win).slice(0,30).map(p=>({id:p.id,n:p.name,w:p.sim_win,t5:p.sim_top5,t10:p.sim_top10,t20:p.sim_top20,mc:p.sim_make_cut}))};
     const h=[e,...hist].slice(0,20);setHist(h);sSet("hist",h);
   },[players,sgW,ctxW,simCount,tourney,hist,ds.matchupPairs]);
 
-  const savePre=()=>{if(!pName.trim())return;const p={name:pName.trim(),sg:{...sgW},cx:{...ctxW}};const u=[...presets.filter(x=>x.name!==p.name),p];setPresets(u);sSet("presets",u);setPName("");};
-  const sorted=useMemo(()=>{if(!simRes)return[];return[...simRes].sort((a,b)=>{const av=a[sort.col]??0,bv=b[sort.col]??0;return sort.dir==="desc"?bv-av:av-bv;});},[simRes,sort]);
-  const evData=useMemo(()=>{
-    if(!simRes)return[];
-    const smk={win:"sim_win",top_5:"sim_top5",top_10:"sim_top10",top_20:"sim_top20",make_cut:"sim_make_cut"};
-    return simRes.map(p=>{
-      const ev={};MARKETS.forEach(m=>{const od=p.playerOdds?.[m];if(od?.bestOdds>1){const imp=decToImp(od.bestOdds);const sp=p[smk[m]]||0;ev["ev_"+m]=sp-imp;ev["sim_"+m]=sp;ev["imp_"+m]=imp;ev["odds_"+m]=od.bestOdds;ev["kelly_"+m]=kellyBet(sp,od.bestOdds,kellyFrac,bankroll);}});
-      return{...p,...ev};
-    }).sort((a,b)=>{const av=a[evS.col]??-999,bv=b[evS.col]??-999;return evS.dir==="desc"?bv-av:av-bv;});
-  },[simRes,evS,kellyFrac,bankroll]);
-
-  const matchupRows=useMemo(()=>{
-    if(!h2hData||!ds.matchupPairs?.length)return[];
-    return ds.matchupPairs.slice(0,300).map(m=>{
-      const s1=h2hData[m.id1+"_"+m.id2]??null,s2=s1!=null?1-s1:null;
-      const i1=decToImp(m.dk1),i2=decToImp(m.dk2);
-      const ev1=s1!=null&&i1>0?s1-i1:null,ev2=s2!=null&&i2>0?s2-i2:null;
-      const k1=ev1>0&&m.dk1>1?kellyBet(s1,m.dk1,kellyFrac,bankroll):0;
-      const k2=ev2>0&&m.dk2>1?kellyBet(s2,m.dk2,kellyFrac,bankroll):0;
-      return{...m,s1,s2,i1,i2,ev1,ev2,k1,k2,bestEV:Math.max(ev1||0,ev2||0)};
-    }).sort((a,b)=>b.bestEV-a.bestEV);
-  },[h2hData,ds.matchupPairs,kellyFrac,bankroll]);
-
-  const dSt={
-    decomp:!!(findArr(ds.decomp)?.length),preds:!!(findArr(ds.preds)?.length),skills:!!(findArr(ds.skills)?.length),
-    odds:Object.keys(ds.odds||{}).filter(k=>(findArr(ds.odds[k])||[]).length>0),matchups:ds.matchupPairs?.length||0,
+  /* ── Event list for dropdowns ── */
+  const fetchEventList=async()=>{
+    setEventListLoading(true);const apiK=apiKey||DG_KEY_HIST;
+    try{const d=await dgFetch("/historical-event-data/events",{key:apiK,tour:"pga"},0);const arr=findArr(d);
+      if(arr?.length){const sorted=arr.sort((a,b)=>(b.calendar_year||0)-(a.calendar_year||0)||(b.event_id||"").localeCompare(a.event_id||""));setEventList(sorted);sSet("eventList",sorted);}
+    }catch(e){console.log("Event list fetch failed:",e);}setEventListLoading(false);
   };
+  useEffect(()=>{const cached=sGet("eventList");if(cached)setEventList(cached);},[]);
+
+  const handleCourseEventSelect=(val)=>{
+    if(!val){setCourseHistEventId("");return;}
+    const [eid,yr]=val.split("|");setCourseHistEventId(eid);setCourseHistYear(yr||"2025");
+  };
+  const handleGradeEventSelect=(val)=>{
+    if(!val){setGradeEventId("");return;}
+    const [eid,yr]=val.split("|");setGradeEventId(eid);setGradeYear(yr||"2025");
+  };
+
+  /* ── Course: fetch historical ── */
+  const fetchCourseHist=async()=>{
+    if(!courseHistEventId)return;setCourseHistLoading(true);setCourseHistStatus("Fetching...");
+    const apiK=apiKey||DG_KEY_HIST;const sgCats=[{k:"sg_ott",l:"Off the Tee"},{k:"sg_app",l:"Approach"},{k:"sg_arg",l:"Around Green"},{k:"sg_putt",l:"Putting"},{k:"sg_t2g",l:"Tee to Green"}];
+    try{
+      const years=[2025,2024,2023,2022,2021,2020,2019];let allRounds=[];
+      for(const yr of years){setCourseHistStatus("Fetching "+courseHistEventId+" "+yr+"...");try{const d=await dgFetch("/historical-raw-data/rounds",{key:apiK,tour:"pga",event_id:courseHistEventId,year:yr},0);const arr=findArr(d);if(arr?.length)allRounds=allRounds.concat(arr.map(r=>({...r,year:yr})));}catch{}}
+      if(!allRounds.length){setCourseHistStatus("No data found.");setCourseHistLoading(false);return;}
+      const byP={};allRounds.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;const key=pid+"_"+r.year;if(!byP[key])byP[key]={pid,name:r.player_name||pid,year:r.year,rounds:0,finish:r.fin_num||r.finish_position||999,sg_ott:0,sg_app:0,sg_arg:0,sg_putt:0,sg_t2g:0};const p=byP[key];p.rounds++;p.sg_ott+=(r.sg_ott||r.sg_off_the_tee||0);p.sg_app+=(r.sg_app||r.sg_approach||0);p.sg_arg+=(r.sg_arg||r.sg_around_the_green||0);p.sg_putt+=(r.sg_putt||r.sg_putting||0);p.sg_t2g+=(r.sg_t2g||r.sg_tee_to_green||0);if(r.fin_num||r.finish_position)p.finish=Math.min(p.finish,r.fin_num||r.finish_position||999);});
+      const entries=Object.values(byP).filter(p=>p.rounds>=3&&p.finish<900);
+      if(entries.length>=10){const finishes=entries.map(e=>e.finish);setCourseCorr({corrs:sgCats.map(c=>({...c,corr:spearmanCorr(entries.map(e=>e[c.k]),finishes),n:entries.length})),n:entries.length,rounds:allRounds.length,years:years.filter(y=>allRounds.some(r=>r.year===y))});}
+
+      /* similar courses */
+      if(similarCourses.length>0){
+        setCourseHistStatus("Fetching similar course data...");let simRounds=[];
+        try{const evts=await dgFetch("/historical-event-data/events",{key:apiK,tour:"pga"},0);const evtArr=findArr(evts)||[];
+          const simNames=similarCourses.slice(0,5).map(c=>c.course.toLowerCase());
+          const matched=evtArr.filter(e=>{const cn=(e.course||"").toLowerCase();return simNames.some(sc=>cn.includes(sc.substring(0,15))||sc.includes(cn.substring(0,15)));});
+          for(const evt of matched.slice(0,15)){setCourseHistStatus("Fetching "+evt.event_id+" "+evt.calendar_year+"...");try{const d=await dgFetch("/historical-raw-data/rounds",{key:apiK,tour:"pga",event_id:evt.event_id,year:evt.calendar_year},0);const arr=findArr(d);if(arr?.length)simRounds=simRounds.concat(arr);}catch{}}
+        }catch{}
+        if(simRounds.length>0){
+          const byP2={};simRounds.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;const key=pid+"_"+(r.year||"")+"_"+(r.event_name||"");if(!byP2[key])byP2[key]={pid,name:r.player_name||pid,rounds:0,finish:r.fin_num||r.finish_position||999,sg_ott:0,sg_app:0,sg_arg:0,sg_putt:0,sg_t2g:0};const p=byP2[key];p.rounds++;p.sg_ott+=(r.sg_ott||r.sg_off_the_tee||0);p.sg_app+=(r.sg_app||r.sg_approach||0);p.sg_arg+=(r.sg_arg||r.sg_around_the_green||0);p.sg_putt+=(r.sg_putt||r.sg_putting||0);p.sg_t2g+=(r.sg_t2g||r.sg_tee_to_green||0);if(r.fin_num||r.finish_position)p.finish=Math.min(p.finish,r.fin_num||r.finish_position||999);});
+          const se=Object.values(byP2).filter(p=>p.rounds>=3&&p.finish<900);
+          if(se.length>=10){const sf=se.map(e=>e.finish);setSimCourseCorr({corrs:sgCats.map(c=>({...c,corr:spearmanCorr(se.map(e=>e[c.k]),sf),n:se.length})),n:se.length,rounds:simRounds.length});}
+          /* player perf at similar courses */
+          const pa={};simRounds.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;if(!pa[pid])pa[pid]={name:r.player_name,rounds:0,sg_total:0};const p=pa[pid];p.rounds++;p.sg_total+=(r.sg_total||0);});
+          Object.values(pa).forEach(p=>{if(p.rounds>0)p.sg_total/=p.rounds;});
+          setPlayerSimCoursePerf(pa);
+          setPlayers(prev=>prev.map(pl=>{const perf=pa[pl.id]||pa[pl.name];return{...pl,similar_course_adj:perf?perf.sg_total:0};}));
+        }
+      }
+      setCourseHistStatus("✓ Analysis complete");
+    }catch(e){setCourseHistStatus("Error: "+e.message);}setCourseHistLoading(false);
+  };
+
+  const fetchWeather=async()=>{const city=tourney?.city||tourney?.course||"";if(!city)return;setWeatherLoading(true);
+    try{const r=await fetch("https://api.weatherapi.com/v1/forecast.json?key="+WEATHER_KEY+"&q="+encodeURIComponent(city)+"&days=7&aqi=no");const d=await r.json();setWeatherData(d.error?{error:d.error.message}:d);}catch(e){setWeatherData({error:e.message});}setWeatherLoading(false);};
+
+  /* ── Grading: fetch results ── */
+  const fetchGradeResults=async()=>{
+    if(!gradeEventId)return;setGradeLoading(true);setGradeStatus("Fetching...");const apiK=apiKey||DG_KEY_HIST;
+    try{const d=await dgFetch("/historical-raw-data/rounds",{key:apiK,tour:"pga",event_id:gradeEventId,year:gradeYear},0);const arr=findArr(d);
+      if(!arr?.length){setGradeStatus("No data found.");setGradeLoading(false);return;}
+      const byP={};arr.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;if(!byP[pid])byP[pid]={pid,name:r.player_name||pid,rounds:0,finish:r.fin_num||r.finish_position||999,sg_ott:0,sg_app:0,sg_arg:0,sg_putt:0,sg_total:0};const p=byP[pid];p.rounds++;p.sg_ott+=(r.sg_ott||r.sg_off_the_tee||0);p.sg_app+=(r.sg_app||r.sg_approach||0);p.sg_arg+=(r.sg_arg||r.sg_around_the_green||0);p.sg_putt+=(r.sg_putt||r.sg_putting||0);p.sg_total+=(r.sg_total||0);if(r.fin_num||r.finish_position)p.finish=Math.min(p.finish,r.fin_num||r.finish_position||999);});
+      const results=Object.values(byP).sort((a,b)=>a.finish-b.finish);setGradeResults(results);
+      const valid=results.filter(r=>r.rounds>=3&&r.finish<900);
+      if(valid.length>=10){const fin=valid.map(r=>r.finish);const sgC=[{k:"sg_ott",l:"Off the Tee"},{k:"sg_app",l:"Approach"},{k:"sg_arg",l:"Around Green"},{k:"sg_putt",l:"Putting"}];
+        const corrs=sgC.map(c=>({...c,corr:spearmanCorr(valid.map(r=>r[c.k]),fin),n:valid.length}));
+        const abs=corrs.map(c=>Math.abs(c.corr));const tot=abs.reduce((a,b)=>a+b,0)||1;
+        setGradeCorr({corrs:corrs.map((c,i)=>({...c,suggestedPct:Math.round(abs[i]/tot*100)})),n:valid.length});}
+      setGradeStatus("✓ Loaded "+results.length+" players");
+    }catch(e){setGradeStatus("Error: "+e.message);}setGradeLoading(false);
+  };
+
+  const savePre=()=>{if(!pName.trim())return;const p={name:pName.trim(),sg:{...sgW},cx:{...ctxW}};const u=[...presets.filter(x=>x.name!==p.name),p];setPresets(u);sSet("presets",u);setPName("");};
+  const sorted=useMemo(()=>simRes?[...simRes].sort((a,b)=>{const av=a[sort.col]??0,bv=b[sort.col]??0;return sort.dir==="desc"?bv-av:av-bv;}):[]     ,[simRes,sort]);
+  const evData=useMemo(()=>{if(!simRes)return[];const smk={win:"sim_win",top_5:"sim_top5",top_10:"sim_top10",top_20:"sim_top20",make_cut:"sim_make_cut"};
+    return simRes.map(p=>{const ev={};MARKETS.forEach(m=>{const od=p.playerOdds?.[m];if(od?.bestOdds>1){const imp=decToImp(od.bestOdds);const sp=p[smk[m]]||0;ev["ev_"+m]=sp-imp;ev["sim_"+m]=sp;ev["imp_"+m]=imp;ev["odds_"+m]=od.bestOdds;ev["kelly_"+m]=kellyBet(sp,od.bestOdds,kellyFrac,bankroll);}});return{...p,...ev};}).sort((a,b)=>{const av=a[evS.col]??-999,bv=b[evS.col]??-999;return evS.dir==="desc"?bv-av:av-bv;});},[simRes,evS,kellyFrac,bankroll]);
+  const matchupRows=useMemo(()=>{if(!h2hData||!ds.matchupPairs?.length)return[];return ds.matchupPairs.slice(0,300).map(m=>{const s1=h2hData[m.id1+"_"+m.id2]??null,s2=s1!=null?1-s1:null;const i1=decToImp(m.dk1),i2=decToImp(m.dk2);const ev1=s1!=null&&i1>0?s1-i1:null,ev2=s2!=null&&i2>0?s2-i2:null;const k1=ev1>0&&m.dk1>1?kellyBet(s1,m.dk1,kellyFrac,bankroll):0;const k2=ev2>0&&m.dk2>1?kellyBet(s2,m.dk2,kellyFrac,bankroll):0;return{...m,s1,s2,i1,i2,ev1,ev2,k1,k2,bestEV:Math.max(ev1||0,ev2||0)};}).sort((a,b)=>b.bestEV-a.bestEV);},[h2hData,ds.matchupPairs,kellyFrac,bankroll]);
+  const dSt={decomp:!!(findArr(ds.decomp)?.length),preds:!!(findArr(ds.preds)?.length),skills:!!(findArr(ds.skills)?.length),odds:Object.keys(ds.odds||{}).filter(k=>(findArr(ds.odds[k])||[]).length>0),matchups:ds.matchupPairs?.length||0};
   const hasOdds=dSt.odds.length>0;
   const tSort=(col,def="desc")=>setSort(s=>s.col===col?{...s,dir:s.dir==="desc"?"asc":"desc"}:{col,dir:def});
   const toggleCmp=(hid)=>setCompareItems(ci=>ci.includes(hid)?ci.filter(x=>x!==hid):ci.length>=2?[ci[1],hid]:[...ci,hid]);
-  const compareData=useMemo(()=>{
-    if(compareItems.length<2)return null;
-    const [a,b]=[hist.find(h=>h.id===compareItems[0]),hist.find(h=>h.id===compareItems[1])];
-    if(!a||!b)return null;
-    const bMap={};b.top30?.forEach(p=>bMap[p.id]=p);
-    return{a,b,rows:(a.top30||[]).map(p=>{const bp=bMap[p.id]||{};return{name:p.n,aW:p.w,bW:bp.w||0,dW:(p.w||0)-(bp.w||0),aT5:p.t5||0,bT5:bp.t5||0,dT5:(p.t5||0)-(bp.t5||0)};}).sort((a,b)=>b.aW-a.aW)};
-  },[compareItems,hist]);
+  const compareData=useMemo(()=>{if(compareItems.length<2)return null;const [a,b]=[hist.find(h=>h.id===compareItems[0]),hist.find(h=>h.id===compareItems[1])];if(!a||!b)return null;const bMap={};b.top30?.forEach(p=>bMap[p.id]=p);return{a,b,rows:(a.top30||[]).map(p=>{const bp=bMap[p.id]||{};return{name:p.n,aW:p.w,bW:bp.w||0,dW:(p.w||0)-(bp.w||0),aT5:p.t5||0,bT5:bp.t5||0,dT5:(p.t5||0)-(bp.t5||0)};}).sort((a,b)=>b.aW-a.aW)};},[compareItems,hist]);
   const csvRes=()=>{if(!sorted.length)return;downloadCSV(sorted.map(p=>({Name:p.name,Win:pFmt(p.sim_win),Top5:pFmt(p.sim_top5),Top10:pFmt(p.sim_top10),Top20:pFmt(p.sim_top20),Cut:pFmt(p.sim_make_cut),AvgPos:p.avg_finish?.toFixed(1),DG_Win:pFmt(p.dg_win)})),"results.csv");};
   const csvEV=()=>{if(!evData.length)return;downloadCSV(evData.filter(p=>MARKETS.some(m=>p["ev_"+m]!=null)).map(p=>({Name:p.name,...Object.fromEntries(MARKETS.flatMap(m=>[["EV_"+m,evFmt(p["ev_"+m])],["Sim_"+m,pFmt(p["sim_"+m])],["Odds_"+m,p["odds_"+m]?.toFixed(2)||""],["Kelly$_"+m,p["kelly_"+m]?.toFixed(2)||""]]))})),"ev_analysis.csv");};
+  const handleCSVUpload=(e)=>{const file=e.target.files?.[0];if(!file)return;const reader=new FileReader();reader.onload=(ev)=>{const data=parseCSV(ev.target.result);if(data.length>0){setCourseCSV(data);sSet("courseCSV",data);}};reader.readAsText(file);};
+  const manualCourseSelect=()=>{if(!courseCSV||!courseMatchManual)return;const m=courseCSV.find(c=>c.course===courseMatchManual);if(m){setCourseMatch(m);const vecs=buildCourseVecs(courseCSV);setSimilarCourses(findSimilarCourses(m.course,vecs,10));}};
 
-  return (
-    <div style={S.root}>
-      <div style={S.header}>
-        <div style={S.hL}><div style={S.logo}>◆</div><div>
-          <h1 style={S.title}>PGA Tournament Simulator <span style={{fontSize:9,color:"#22d3ee",background:"#164e63",padding:"1px 6px",borderRadius:3}}>v2</span></h1>
-          <div style={S.sub}>{tourney?tourney.name+" · "+tourney.course:"Sensitivity×4 · 5 SG Sliders · Kelly Criterion · H2H Matchups"}</div>
-        </div></div>
-        <div style={S.badges}>{players.length>0&&<span style={S.badge}>{players.length} players</span>}{simRes&&<span style={S.badge}>{simCount.toLocaleString()} sims</span>}{allScores&&<span style={{...S.badge,color:"#22d3ee",borderColor:"#0e7490"}}>H2H ready</span>}</div>
+  /* ═══ RENDER ═══ */
+  return(<div style={S.root}>
+    <div style={S.header}><div style={S.hL}><div style={S.logo}>◆</div><div><h1 style={S.title}>PGA Tournament Simulator <span style={{fontSize:9,color:"#22d3ee",background:"#164e63",padding:"1px 6px",borderRadius:3}}>v3</span></h1><div style={S.sub}>{tourney?tourney.name+" · "+tourney.course:"Course Intel · SG Weights · Kelly Criterion · Grading"}</div></div></div>
+      <div style={S.badges}>{players.length>0&&<span style={S.badge}>{players.length} players</span>}{simRes&&<span style={S.badge}>{simCount.toLocaleString()} sims</span>}{courseCSV&&<span style={{...S.badge,color:"#a78bfa",borderColor:"#7c3aed"}}>{courseCSV.length} courses</span>}{allScores&&<span style={{...S.badge,color:"#22d3ee",borderColor:"#0e7490"}}>H2H ready</span>}</div></div>
+
+    <div style={S.tabs}>{[["setup","⚙","Setup",true],["course","🏌","Course",true],["weights","⚖","Weights",players.length>0],["simulate","▶","Simulate",players.length>0],["results","📊","Results",!!simRes],["ev","💰","EV",!!simRes],["matchups","⚔","Matchups",!!simRes&&(ds.matchupPairs?.length>0)],["grading","📝","Grading",true],["history","🕐","History",true]].map(([id,ic,lb,en])=>(<button key={id} disabled={!en} onClick={()=>setTab(id)} style={{...S.tab,...(tab===id?S.tabOn:{}),...(!en?S.tabOff:{})}}>{ic} {lb}</button>))}</div>
+    {error&&<div style={S.err}>⚠ {error}</div>}
+
+    {/* SETUP */}
+    {tab==="setup"&&<div style={S.panel}>
+      <h2 style={S.h2}>API Configuration</h2>
+      <div style={S.row}><input type="password" value={apiKeyInp} onChange={e=>setApiKeyInp(e.target.value)} placeholder="DataGolf API key..." style={S.inp}/><button onClick={saveKey} style={S.btnP}>Save Key</button></div>
+      {apiKey&&<div style={S.ok}>✓ Key saved</div>}
+      <button onClick={()=>fetchAll(0)} disabled={!apiKey||loading} style={{...S.btnBig,marginTop:14,opacity:(!apiKey||loading)?0.5:1}}>{loading?"⏳ "+fetchSt:"🔄 Fetch Current Tournament Data"}</button>
+      <div style={{...S.dv,margin:"22px 0 14px"}}/>
+      <h2 style={S.h2}>Data Import Dashboard</h2>
+      <div style={{display:"flex",flexDirection:"column",gap:5}}>
+        {[{key:"decomp",label:"Player Decompositions",req:true,on:dSt.decomp,desc:"baseline_pred, driving adjustments, approach, short game, putting, course history, fit, form",path:"/preds/player-decompositions?tour=pga"},{key:"preds",label:"Pre-Tournament Predictions",on:dSt.preds,desc:"DG model win/top5/top10/top20/make_cut",path:"/preds/pre-tournament?tour=pga&odds_format=percent"},{key:"skills",label:"Skill Ratings",on:dSt.skills,desc:"Overall SG ratings per category",path:"/preds/skill-ratings?display=value"},{key:"odds_win",label:"Odds — Win",on:dSt.odds.includes("win"),desc:"DraftKings outright win odds",path:"/betting-tools/outrights?tour=pga&market=win&odds_format=decimal"},{key:"odds_t5",label:"Odds — Top 5",on:dSt.odds.includes("top_5"),desc:"DraftKings Top 5",path:"/betting-tools/outrights?tour=pga&market=top_5&odds_format=decimal"},{key:"odds_t10",label:"Odds — Top 10",on:dSt.odds.includes("top_10"),desc:"DraftKings Top 10",path:"/betting-tools/outrights?tour=pga&market=top_10&odds_format=decimal"},{key:"odds_t20",label:"Odds — Top 20",on:dSt.odds.includes("top_20"),desc:"DraftKings Top 20",path:"/betting-tools/outrights?tour=pga&market=top_20&odds_format=decimal"},{key:"matchups",label:"Matchups ("+dSt.matchups+")",on:dSt.matchups>0,desc:"72-hole H2H pairs",path:"/betting-tools/matchups?tour=pga&market=tournament_matchups&odds_format=decimal"}].map(d=>(<div key={d.key} style={{...S.stRow,borderLeft:"3px solid "+(d.on?"#22c55e":d.req?"#f59e0b":"#334155")}}><div style={{flex:1}}><span style={{color:d.on?"#22c55e":"#64748b",fontWeight:600,fontSize:12}}>{d.on?"✓":"○"} {d.label}{d.req&&!d.on&&<span style={{color:"#f59e0b",fontSize:9,marginLeft:5}}>REQUIRED</span>}</span><div style={{fontSize:10,color:"#475569",marginTop:1}}>{d.desc}</div></div>{apiKey&&!d.on&&<button onClick={()=>window.open(DG_BASE+d.path+"&file_format=json&key="+apiKey,"_blank")} style={S.btnSm}>Open ↗</button>}</div>))}
       </div>
+      <div style={{marginTop:14}}><PasteBox onImport={handleImport}/></div>
+      {players.length>0&&<div style={S.loadBar}><span>✓ {players.length} players loaded</span><button onClick={()=>setTab("course")} style={S.btnP}>Course →</button></div>}
+    </div>}
 
-      <div style={S.tabs}>
-        {[["setup","⚙","Setup",true],["weights","⚖","Weights",players.length>0],["simulate","▶","Simulate",players.length>0],["results","📊","Results",!!simRes],["ev","💰","EV",!!simRes],["matchups","⚔","Matchups",!!simRes&&(ds.matchupPairs?.length>0||false)],["history","🕐","History",true]].map(([id,ic,lb,en])=>(
-          <button key={id} disabled={!en} onClick={()=>setTab(id)} style={{...S.tab,...(tab===id?S.tabOn:{}),...(!en?S.tabOff:{})}}>{ic} {lb}</button>
-        ))}
+    {/* COURSE */}
+    {tab==="course"&&<div style={S.panel}>
+      <h2 style={S.h2}>Course Intelligence</h2><p style={S.help}>Upload CSV, analyze course profile, weather, and get data-driven weight suggestions.</p>
+      <div style={S.section}><h3 style={S.h3}>📊 Course Database</h3><div style={{display:"flex",gap:8,alignItems:"center"}}><input type="file" accept=".csv" onChange={handleCSVUpload} style={{fontSize:11,color:"#94a3b8"}}/>{courseCSV&&<span style={{fontSize:11,color:"#22c55e"}}>✓ {courseCSV.length} courses</span>}</div></div>
+
+      {courseCSV&&<div style={S.section}><h3 style={S.h3}>🎯 Course Match</h3>
+        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:8}}><select value={courseMatchManual} onChange={e=>setCourseMatchManual(e.target.value)} style={{...S.inp,maxWidth:400}}><option value="">Select course...</option>{courseCSV.map(c=><option key={c.course} value={c.course}>{c.course}</option>)}</select><button onClick={manualCourseSelect} style={S.btnSm}>Match</button>{tourney?.course&&<span style={{fontSize:10,color:"#64748b"}}>Auto: {tourney.course}</span>}</div>
+        {courseMatch&&<div style={{padding:12,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:14,fontWeight:700,color:"#22d3ee",marginBottom:8}}>{courseMatch.course}</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(120px,1fr))",gap:8}}>{[["Par",courseMatch.par],["Yardage",courseMatch.yardage],["Adj Score",courseMatch.adj_score_to_par?.toFixed(2)],["Drv Dist",courseMatch.adj_driving_distance?.toFixed(1)],["Drv Acc",typeof courseMatch.adj_driving_accuracy==="number"?(courseMatch.adj_driving_accuracy*100).toFixed(1)+"%":"-"],["FW Width",courseMatch.fw_width?.toFixed(1)],["GIR",typeof courseMatch.adj_gir==="number"?(courseMatch.adj_gir*100).toFixed(1)+"%":"-"],["SG Putt",courseMatch.putt_sg?.toFixed(3)],["SG App",courseMatch.app_sg?.toFixed(3)],["SG OTT",courseMatch.ott_sg?.toFixed(3)],["SG ARG",courseMatch.arg_sg?.toFixed(3)],["Penalties",courseMatch.adj_penalties?.toFixed(2)]].map(([l,v])=>(<div key={l}><div style={{fontSize:8,color:"#64748b",textTransform:"uppercase"}}>{l}</div><div style={{fontSize:13,fontWeight:700,color:"#e2e8f0"}}>{v??"-"}</div></div>))}</div>
+        </div>}
+      </div>}
+
+      {similarCourses.length>0&&<div style={S.section}><h3 style={S.h3}>🔗 Top 10 Similar Courses</h3>
+        <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Course</th><th style={S.th}>Similarity</th><th style={S.th}>Par</th><th style={S.th}>Yards</th><th style={S.th}>Adj Score</th><th style={S.th}>FW Width</th><th style={S.th}>SG Putt</th><th style={S.th}>SG App</th><th style={S.th}>SG OTT</th></tr></thead><tbody>
+          {similarCourses.map((c,i)=>(<tr key={c.course} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{c.course}</td><td style={{...S.td,fontWeight:700,color:c.sim>0.95?"#22c55e":c.sim>0.9?"#22d3ee":"#94a3b8"}}>{(c.sim*100).toFixed(1)}%</td><td style={S.td}>{c.data.par}</td><td style={S.td}>{c.data.yardage}</td><td style={S.td}>{c.data.adj_score_to_par?.toFixed(2)}</td><td style={S.td}>{c.data.fw_width?.toFixed(1)}</td><td style={S.td}>{c.data.putt_sg?.toFixed(3)}</td><td style={S.td}>{c.data.app_sg?.toFixed(3)}</td><td style={S.td}>{c.data.ott_sg?.toFixed(3)}</td></tr>))}
+        </tbody></table></div></div>}
+
+      {courseCSV&&<div style={S.section}><h3 style={S.h3}>📈 Historical Course Profile</h3><p style={{fontSize:10,color:"#64748b",marginBottom:8}}>Fetch historical rounds to see which SG categories correlate with good finishes.</p>
+        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:10}}>
+          {!eventList&&<button onClick={fetchEventList} disabled={eventListLoading} style={{...S.btnSm,background:"#1e293b",color:"#94a3b8",border:"1px solid #334155"}}>{eventListLoading?"Loading events...":"Load Event List"}</button>}
+          {eventList&&<select value={courseHistEventId?courseHistEventId+"|"+courseHistYear:""} onChange={e=>handleCourseEventSelect(e.target.value)} style={{...S.inp,maxWidth:400}}>
+            <option value="">Select tournament...</option>
+            {eventList.map((ev,i)=><option key={i} value={(ev.event_id||"")+"|"+(ev.calendar_year||"")}>{ev.event_name||ev.event_id} — {ev.calendar_year}{ev.course?" · "+ev.course:""}</option>)}
+          </select>}
+          <button onClick={fetchCourseHist} disabled={courseHistLoading||!courseHistEventId} style={{...S.btnP,opacity:courseHistLoading||!courseHistEventId?0.5:1}}>{courseHistLoading?"⏳ Loading...":"Fetch Historical Data"}</button>
+        </div>
+        {courseHistStatus&&<div style={{fontSize:11,color:courseHistStatus.startsWith("✓")?"#22c55e":"#94a3b8",marginBottom:10}}>{courseHistStatus}</div>}
+        {(courseCorr||simCourseCorr)&&<div style={{display:"grid",gridTemplateColumns:courseCorr&&simCourseCorr?"1fr 1fr":"1fr",gap:18}}>
+          {courseCorr&&<div style={{padding:14,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:12,fontWeight:700,color:"#22d3ee",marginBottom:4}}>This Course</div><div style={{fontSize:9,color:"#64748b",marginBottom:10}}>{courseCorr.n} player-events · {courseCorr.rounds} rounds · Years: {courseCorr.years?.join(", ")}</div><div style={{fontSize:9,color:"#64748b",marginBottom:6}}>Correlation to finish (negative = good finishes)</div>{courseCorr.corrs.map(c=><CorrBar key={c.k} val={c.corr} label={c.l}/>)}</div>}
+          {simCourseCorr&&<div style={{padding:14,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:12,fontWeight:700,color:"#a78bfa",marginBottom:4}}>Similar Courses</div><div style={{fontSize:9,color:"#64748b",marginBottom:10}}>{simCourseCorr.n} player-events · {simCourseCorr.rounds} rounds</div><div style={{fontSize:9,color:"#64748b",marginBottom:6}}>Correlation to finish (negative = good finishes)</div>{simCourseCorr.corrs.map(c=><CorrBar key={c.k} val={c.corr} label={c.l} color="#a78bfa"/>)}</div>}
+        </div>}
+      </div>}
+
+      {players.length>0&&<div style={S.section}><h3 style={S.h3}>🎯 DataGolf Fit Benchmark — Top 15</h3>
+        <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player</th><th style={S.th}>Course Fit</th><th style={S.th}>Course History</th><th style={S.th}>Combined</th>{playerSimCoursePerf&&<th style={{...S.th,color:"#a78bfa"}}>Sim Course SG</th>}</tr></thead><tbody>
+          {[...players].sort((a,b)=>((b.course_fit_adj||0)+(b.course_history_adj||0))-((a.course_fit_adj||0)+(a.course_history_adj||0))).slice(0,15).map((p,i)=>{const perf=playerSimCoursePerf?.[p.id]||playerSimCoursePerf?.[p.name];return<tr key={p.id} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{p.name}</td><td style={{...S.td,color:(p.course_fit_adj||0)>0?"#22c55e":"#ef4444"}}>{(p.course_fit_adj||0)>0?"+":""}{(p.course_fit_adj||0).toFixed(3)}</td><td style={{...S.td,color:(p.course_history_adj||0)>0?"#22c55e":"#ef4444"}}>{(p.course_history_adj||0)>0?"+":""}{(p.course_history_adj||0).toFixed(3)}</td><td style={{...S.td,fontWeight:700,color:((p.course_fit_adj||0)+(p.course_history_adj||0))>0?"#22c55e":"#ef4444"}}>{((p.course_fit_adj||0)+(p.course_history_adj||0))>0?"+":""}{((p.course_fit_adj||0)+(p.course_history_adj||0)).toFixed(3)}</td>{playerSimCoursePerf&&<td style={{...S.td,color:perf?.sg_total>0?"#a78bfa":"#64748b"}}>{perf?(perf.sg_total>0?"+":"")+perf.sg_total.toFixed(3)+" ("+perf.rounds+"r)":"-"}</td>}</tr>;})}
+        </tbody></table></div></div>}
+
+      {fieldComp&&<div style={S.section}><h3 style={S.h3}>📊 Field Composition</h3><p style={{fontSize:10,color:"#64748b",marginBottom:8}}>Where separation lies. Higher spread = more differentiation.</p>
+        {fieldComp.sort((a,b)=>b.spread-a.spread).map(c=>(<div key={c.k} style={{marginBottom:10,padding:"8px 12px",background:"#0f172a",borderRadius:5}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><span style={{fontSize:11,fontWeight:600,color:"#e2e8f0"}}>{c.l}</span><span style={{fontSize:10,color:"#22d3ee"}}>Spread: {c.spread.toFixed(3)} · Std: {c.std.toFixed(3)}</span></div><div style={{display:"flex",gap:12,fontSize:9,color:"#64748b"}}><span>Avg: {c.avg.toFixed(3)}</span><span>Min: {c.min.toFixed(3)}</span><span>Max: {c.max.toFixed(3)}</span></div></div>))}</div>}
+
+      <div style={S.section}><h3 style={S.h3}>🌤 Weather Forecast</h3><div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10}}><span style={{fontSize:10,color:"#64748b"}}>Location: {tourney?.city||tourney?.course||"Load tournament first"}</span><button onClick={fetchWeather} disabled={weatherLoading} style={{...S.btnSm,opacity:weatherLoading?0.5:1}}>{weatherLoading?"Loading...":"Fetch Weather"}</button></div>
+        {weatherData?.error&&<div style={{fontSize:11,color:"#fca5a5"}}>{weatherData.error}</div>}
+        {weatherData?.forecast&&<div><div style={{fontSize:11,color:"#94a3b8",marginBottom:8}}>{weatherData.location?.name}, {weatherData.location?.region}</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:8}}>{weatherData.forecast.forecastday.map(d=>{const windy=d.day.maxwind_mph>=15,rainy=d.day.daily_chance_of_rain>=40;return<div key={d.date} style={{padding:10,background:"#0f172a",borderRadius:6,border:"1px solid "+(windy||rainy?"#f59e0b":"#1e293b")}}><div style={{fontSize:10,fontWeight:700,color:"#cbd5e1"}}>{new Date(d.date+"T12:00").toLocaleDateString("en",{weekday:"short",month:"short",day:"numeric"})}</div><div style={{fontSize:18,fontWeight:700,color:"#e2e8f0",margin:"4px 0"}}>{d.day.maxtemp_f?.toFixed(0)}°F</div><div style={{fontSize:9,color:"#64748b"}}>{d.day.condition?.text}</div><div style={{fontSize:9,color:windy?"#f59e0b":"#64748b",marginTop:3}}>💨 {d.day.maxwind_mph} mph</div><div style={{fontSize:9,color:rainy?"#f59e0b":"#64748b"}}>🌧 {d.day.daily_chance_of_rain}%</div>{(windy||rainy)&&<div style={{fontSize:8,color:"#f59e0b",marginTop:4,padding:"2px 4px",background:"#1a1a0e",borderRadius:3}}>{windy?"↑ Drv Acc":""}{windy&&rainy?" · ":""}{rainy?"↑ ARG/Putt":""}</div>}</div>;})}</div></div>}
       </div>
-      {error&&<div style={S.err}>⚠ {error}</div>}
+    </div>}
 
-      {tab==="setup"&&<div style={S.panel}>
-        <h2 style={S.h2}>API Configuration</h2>
-        <div style={S.row}><input type="password" value={apiKeyInp} onChange={e=>setApiKeyInp(e.target.value)} placeholder="DataGolf API key..." style={S.inp}/><button onClick={saveKey} style={S.btnP}>Save Key</button></div>
-        {apiKey&&<div style={S.ok}>✓ Key saved</div>}
-        <button onClick={()=>fetchAll(0)} disabled={!apiKey||loading} style={{...S.btnBig,marginTop:14,opacity:(!apiKey||loading)?0.5:1}}>{loading?"⏳ "+fetchSt:"🔄 Fetch Current Tournament Data"}</button>
-        <div style={{...S.dv,margin:"22px 0 14px"}}/>
-        <h2 style={S.h2}>Data Import Dashboard</h2>
-        <div style={{display:"flex",flexDirection:"column",gap:5}}>
-          {[
-            {key:"decomp",label:"Player Decompositions",req:true,on:dSt.decomp,desc:"baseline_pred, driving_distance_adjustment, driving_accuracy_adjustment, cf_approach_comp, cf_short_comp, putting_adjustment, course_history_adjustment, total_fit_adjustment, true_sg_adjustments",path:"/preds/player-decompositions?tour=pga"},
-            {key:"preds",label:"Pre-Tournament Predictions",on:dSt.preds,desc:"DG model win/top5/top10/top20/make_cut probabilities",path:"/preds/pre-tournament?tour=pga&odds_format=percent"},
-            {key:"skills",label:"Skill Ratings",on:dSt.skills,desc:"Overall SG ratings per category per player",path:"/preds/skill-ratings?display=value"},
-            {key:"odds_win",label:"Odds — Win",on:dSt.odds.includes("win"),desc:"DraftKings outright win odds",path:"/betting-tools/outrights?tour=pga&market=win&odds_format=decimal"},
-            {key:"odds_t5",label:"Odds — Top 5",on:dSt.odds.includes("top_5"),desc:"DraftKings Top 5 finish odds",path:"/betting-tools/outrights?tour=pga&market=top_5&odds_format=decimal"},
-            {key:"odds_t10",label:"Odds — Top 10",on:dSt.odds.includes("top_10"),desc:"DraftKings Top 10 finish odds",path:"/betting-tools/outrights?tour=pga&market=top_10&odds_format=decimal"},
-            {key:"odds_t20",label:"Odds — Top 20",on:dSt.odds.includes("top_20"),desc:"DraftKings Top 20 finish odds",path:"/betting-tools/outrights?tour=pga&market=top_20&odds_format=decimal"},
-            {key:"matchups",label:"Tournament Matchups ("+dSt.matchups+" loaded)",on:dSt.matchups>0,desc:"72-hole H2H pairs with DraftKings odds → matchup EV tab",path:"/betting-tools/matchups?tour=pga&market=tournament_matchups&odds_format=decimal"},
-          ].map(d=>(<div key={d.key} style={{...S.stRow,borderLeft:"3px solid "+(d.on?"#22c55e":d.req?"#f59e0b":"#334155")}}>
-            <div style={{flex:1}}><span style={{color:d.on?"#22c55e":"#64748b",fontWeight:600,fontSize:12}}>{d.on?"✓":"○"} {d.label}{d.req&&!d.on&&<span style={{color:"#f59e0b",fontSize:9,marginLeft:5}}>REQUIRED</span>}</span><div style={{fontSize:10,color:"#475569",marginTop:1}}>{d.desc}</div></div>
-            {apiKey&&!d.on&&<button onClick={()=>window.open(DG_BASE+d.path+"&file_format=json&key="+apiKey,"_blank")} style={S.btnSm}>Open ↗</button>}
-          </div>))}
-        </div>
-        <div style={{marginTop:14}}><PasteBox onImport={handleImport}/></div>
-        {players.length>0&&<div style={S.loadBar}><span>✓ {players.length} players loaded</span><button onClick={()=>setTab("weights")} style={S.btnP}>Weights →</button></div>}
-      </div>}
+    {/* WEIGHTS */}
+    {tab==="weights"&&<div style={S.panel}><div style={{display:"grid",gridTemplateColumns:"1fr 250px",gap:18}}><div>
+      <h2 style={S.h2}>Strokes Gained Weights <span style={{fontSize:10,color:"#64748b",fontWeight:400}}>(sum to 100%)</span></h2>
+      <div style={{fontSize:10,color:"#94a3b8",marginBottom:12,padding:"7px 11px",background:"#0f172a",borderRadius:4,borderLeft:"3px solid #22d3ee"}}>SENSITIVITY ×{SENSITIVITY}: delta amplified {SENSITIVITY}×</div>
+      {[{k:"dist",l:"SG: Driving Distance",d:"driving_distance_adjustment"},{k:"acc",l:"SG: Driving Accuracy",d:"driving_accuracy_adjustment"},{k:"app",l:"SG: Approach",d:"cf_approach_comp"},{k:"arg",l:"SG: Around the Green",d:"cf_short_comp"},{k:"putt",l:"SG: Putting",d:"putting_adjustment"}].map(s=>(<div key={s.k} style={S.slG}><div style={S.slH}><span style={S.slL}>{s.l}</span><span style={S.slV}>{sgW[s.k]}%</span></div><div style={{fontSize:10,color:"#64748b",marginBottom:3}}>{s.d}</div><input type="range" min={0} max={100} value={sgW[s.k]} onChange={e=>adjSG(s.k,+e.target.value)} style={S.slider}/></div>))}
+      <div style={{padding:"8px 12px",background:"#0f172a",borderRadius:5,marginTop:4,fontSize:11,color:"#94a3b8"}}>Total: <b style={{color:Object.values(sgW).reduce((a,b)=>a+b,0)===100?"#22c55e":"#ef4444"}}>{Object.values(sgW).reduce((a,b)=>a+b,0)}%</b></div>
+      <div style={{...S.dv,margin:"20px 0"}}/>
+      <h2 style={S.h2}>Contextual Multipliers <span style={{fontSize:10,color:"#64748b",fontWeight:400}}>(0%=off 100%=full 200%=doubled)</span></h2>
+      {[{k:"ch",l:"Course History",d:"course_history_adjustment"},{k:"cf",l:"Course Fit",d:"total_fit_adjustment"},{k:"rf",l:"Recent Form",d:"true_sg_adjustments"},{k:"sc",l:"Similar Course Performance",d:"Per-round SG at similar courses (from Course tab)",color:"#a78bfa"}].map(s=>(<div key={s.k} style={S.slG}><div style={S.slH}><span style={{...S.slL,color:s.color||"#e2e8f0"}}>{s.l}</span><span style={{...S.slV,color:s.color||"#22d3ee"}}>{ctxW[s.k]}%</span></div><div style={{fontSize:10,color:"#64748b",marginBottom:3}}>{s.d}</div><input type="range" min={0} max={200} value={ctxW[s.k]} onChange={e=>setCtxW(w=>({...w,[s.k]:+e.target.value}))} style={S.slider}/></div>))}
+    </div><div style={S.side}><h3 style={S.h3}>Saved Presets</h3><div style={{display:"flex",gap:4,marginBottom:8}}><input value={pName} onChange={e=>setPName(e.target.value)} placeholder="Name..." style={{...S.inp,fontSize:11,padding:"5px 8px"}}/><button onClick={savePre} disabled={!pName.trim()} style={{...S.btnSm,opacity:pName.trim()?1:0.4}}>Save</button></div>
+      {presets.map(p=>(<div key={p.name} style={{display:"flex",gap:3,marginBottom:3}}><button onClick={()=>{setSgW(p.sg);setCtxW(prev=>({...prev,...p.cx}));}} style={S.preBtn}>{p.name}</button><button onClick={()=>{const u=presets.filter(x=>x.name!==p.name);setPresets(u);sSet("presets",u);}} style={S.preDel}>✕</button></div>))}{!presets.length&&<div style={S.empty}>No presets</div>}
+      <div style={{...S.dv,margin:"12px 0"}}/><h3 style={S.h3}>Quick Profiles</h3>
+      {[{n:"Balanced",sg:{dist:20,acc:10,app:30,arg:20,putt:20},cx:{ch:100,cf:100,rf:100,sc:100}},{n:"Ball Striker",sg:{dist:20,acc:10,app:40,arg:15,putt:15},cx:{ch:100,cf:120,rf:100,sc:100}},{n:"Distance",sg:{dist:35,acc:5,app:25,arg:20,putt:15},cx:{ch:100,cf:130,rf:100,sc:100}},{n:"Scrambler",sg:{dist:5,acc:10,app:20,arg:35,putt:30},cx:{ch:100,cf:100,rf:100,sc:100}},{n:"Putting Guru",sg:{dist:10,acc:10,app:25,arg:20,putt:35},cx:{ch:100,cf:80,rf:100,sc:100}},{n:"Course Horse",sg:{dist:20,acc:10,app:30,arg:20,putt:20},cx:{ch:180,cf:150,rf:80,sc:150}},{n:"Hot Hand",sg:{dist:20,acc:10,app:30,arg:20,putt:20},cx:{ch:60,cf:60,rf:180,sc:60}}].map(q=>(<button key={q.n} onClick={()=>{setSgW(q.sg);setCtxW(q.cx);}} style={S.qpBtn}>{q.n}</button>))}
+    </div></div></div>}
 
-      {tab==="weights"&&<div style={S.panel}>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 250px",gap:18}}>
-          <div>
-            <h2 style={S.h2}>Strokes Gained Weights <span style={{fontSize:10,color:"#64748b",fontWeight:400}}>(linked — always sum to 100%)</span></h2>
-            <div style={{fontSize:10,color:"#94a3b8",marginBottom:12,padding:"7px 11px",background:"#0f172a",borderRadius:4,borderLeft:"3px solid #22d3ee"}}>SENSITIVITY ×{SENSITIVITY}: the delta between your weights and equal weighting is amplified {SENSITIVITY}× — going all-in on putting vs off-the-tee will produce meaningfully different rankings</div>
-            {[{k:"dist",l:"SG: Driving Distance",d:"DG field: driving_distance_adjustment"},{k:"acc",l:"SG: Driving Accuracy",d:"DG field: driving_accuracy_adjustment"},{k:"app",l:"SG: Approach",d:"DG field: cf_approach_comp — iron play, proximity"},{k:"arg",l:"SG: Around the Green",d:"DG field: cf_short_comp — chipping, bunkers"},{k:"putt",l:"SG: Putting",d:"DG field: putting_adjustment — green reading, stroke quality"}].map(s=>(
-              <div key={s.k} style={S.slG}><div style={S.slH}><span style={S.slL}>{s.l}</span><span style={S.slV}>{sgW[s.k]}%</span></div><div style={{fontSize:10,color:"#64748b",marginBottom:3}}>{s.d}</div><input type="range" min={0} max={100} value={sgW[s.k]} onChange={e=>adjSG(s.k,+e.target.value)} style={S.slider}/></div>
-            ))}
-            <div style={{padding:"8px 12px",background:"#0f172a",borderRadius:5,marginTop:4,fontSize:11,color:"#94a3b8"}}>Total: <b style={{color:Object.values(sgW).reduce((a,b)=>a+b,0)===100?"#22c55e":"#ef4444"}}>{Object.values(sgW).reduce((a,b)=>a+b,0)}%</b></div>
-            <div style={{...S.dv,margin:"20px 0"}}/>
-            <h2 style={S.h2}>Contextual Adjustment Multipliers <span style={{fontSize:10,color:"#64748b",fontWeight:400}}>(0%=off 100%=full DG value 200%=doubled)</span></h2>
-            {[{k:"ch",l:"Course History",d:"DG field: course_history_adjustment — past results at this venue"},{k:"cf",l:"Course Fit",d:"DG field: total_fit_adjustment — skill profile vs course demands"},{k:"rf",l:"Recent Form",d:"DG field: true_sg_adjustments — trending performance / timing"}].map(s=>(
-              <div key={s.k} style={S.slG}><div style={S.slH}><span style={S.slL}>{s.l}</span><span style={S.slV}>{ctxW[s.k]}%</span></div><div style={{fontSize:10,color:"#64748b",marginBottom:3}}>{s.d}</div><input type="range" min={0} max={200} value={ctxW[s.k]} onChange={e=>setCtxW(w=>({...w,[s.k]:+e.target.value}))} style={S.slider}/></div>
-            ))}
-          </div>
-          <div style={S.side}>
-            <h3 style={S.h3}>Saved Presets</h3>
-            <div style={{display:"flex",gap:4,marginBottom:8}}><input value={pName} onChange={e=>setPName(e.target.value)} placeholder="Name..." style={{...S.inp,fontSize:11,padding:"5px 8px"}}/><button onClick={savePre} disabled={!pName.trim()} style={{...S.btnSm,opacity:pName.trim()?1:0.4}}>Save</button></div>
-            {presets.map(p=>(<div key={p.name} style={{display:"flex",gap:3,marginBottom:3}}><button onClick={()=>{setSgW(p.sg);setCtxW(p.cx);}} style={S.preBtn}>{p.name}</button><button onClick={()=>{const u=presets.filter(x=>x.name!==p.name);setPresets(u);sSet("presets",u);}} style={S.preDel}>✕</button></div>))}
-            {!presets.length&&<div style={S.empty}>No presets yet</div>}
-            <div style={{...S.dv,margin:"12px 0"}}/>
-            <h3 style={S.h3}>Quick Profiles</h3>
-            {[
-              {n:"Balanced",sg:{dist:20,acc:10,app:30,arg:20,putt:20},cx:{ch:100,cf:100,rf:100}},
-              {n:"Ball Striker",sg:{dist:20,acc:10,app:40,arg:15,putt:15},cx:{ch:100,cf:120,rf:100}},
-              {n:"Distance Bomb",sg:{dist:35,acc:5,app:25,arg:20,putt:15},cx:{ch:100,cf:130,rf:100}},
-              {n:"Scrambler",sg:{dist:5,acc:10,app:20,arg:35,putt:30},cx:{ch:100,cf:100,rf:100}},
-              {n:"Putting Guru",sg:{dist:10,acc:10,app:25,arg:20,putt:35},cx:{ch:100,cf:80,rf:100}},
-              {n:"Course Horse",sg:{dist:20,acc:10,app:30,arg:20,putt:20},cx:{ch:180,cf:150,rf:80}},
-              {n:"Hot Hand",sg:{dist:20,acc:10,app:30,arg:20,putt:20},cx:{ch:60,cf:60,rf:180}},
-            ].map(q=>(<button key={q.n} onClick={()=>{setSgW(q.sg);setCtxW(q.cx);}} style={S.qpBtn}>{q.n}</button>))}
-          </div>
-        </div>
-      </div>}
+    {/* SIMULATE */}
+    {tab==="simulate"&&<div style={S.panel}><h2 style={S.h2}>Run Simulation</h2>
+      <div style={{fontSize:10,color:"#64748b",marginBottom:12,padding:"6px 10px",background:"#0f172a",borderRadius:4,borderLeft:"3px solid "+(simCount<=MAX_STORE?"#22c55e":"#f59e0b")}}>H2H: {simCount<=MAX_STORE?"✓ Stored":"✗ Too many sims"}</div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:18,marginBottom:18}}><div><label style={S.label}>Iterations</label><div style={{display:"flex",gap:5,flexWrap:"wrap"}}>{SIM_COUNTS.map(c=>(<button key={c} onClick={()=>setSimCount_(c)} style={{...S.simBtn,...(simCount===c?S.simBtnOn:{})}}>{c.toLocaleString()}</button>))}</div></div>
+        <div style={S.cfgBox}><h3 style={S.h3}>Config</h3><div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:5}}>{[["Players",players.length],["Sims",simCount.toLocaleString()],["Dist",sgW.dist+"%"],["Acc",sgW.acc+"%"],["App",sgW.app+"%"],["ARG",sgW.arg+"%"],["Putt",sgW.putt+"%"],["Hx",ctxW.ch+"%"],["Fit",ctxW.cf+"%"],["Form",ctxW.rf+"%"],["SimC",ctxW.sc+"%"]].map(([l,v])=>(<div key={l}><div style={{fontSize:8,color:"#64748b",textTransform:"uppercase"}}>{l}</div><div style={{fontSize:12,fontWeight:700,color:"#e2e8f0"}}>{v}</div></div>))}</div></div></div>
+      <button onClick={doSim} disabled={simRunning||!players.length} style={{...S.btnRun,opacity:(simRunning||!players.length)?0.6:1}}>{simRunning?"⏳ Running...":"▶ Run "+simCount.toLocaleString()+" Simulations"}</button>
+    </div>}
 
-      {tab==="simulate"&&<div style={S.panel}>
-        <h2 style={S.h2}>Run Simulation</h2>
-        <div style={{fontSize:10,color:"#64748b",marginBottom:12,padding:"6px 10px",background:"#0f172a",borderRadius:4,borderLeft:"3px solid "+(simCount<=MAX_STORE?"#22c55e":"#f59e0b")}}>H2H matchup analysis: {simCount<=MAX_STORE?"✓ Per-sim scores will be stored for H2H EV (≤"+MAX_STORE.toLocaleString()+" sims)":"✗ Scores not stored above "+MAX_STORE.toLocaleString()+" sims — reduce count to enable matchup EV"}</div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:18,marginBottom:18}}>
-          <div><label style={S.label}>Iterations</label><div style={{display:"flex",gap:5,flexWrap:"wrap"}}>{SIM_COUNTS.map(c=>(<button key={c} onClick={()=>setSimCount_(c)} style={{...S.simBtn,...(simCount===c?S.simBtnOn:{})}}>{c.toLocaleString()}</button>))}</div></div>
-          <div style={S.cfgBox}><h3 style={S.h3}>Config</h3><div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:5}}>{[["Players",players.length],["Sims",simCount.toLocaleString()],["Dist",sgW.dist+"%"],["Acc",sgW.acc+"%"],["App",sgW.app+"%"],["ARG",sgW.arg+"%"],["Putt",sgW.putt+"%"],["Hx",ctxW.ch+"%"],["Fit",ctxW.cf+"%"],["Form",ctxW.rf+"%"]].map(([l,v])=>(<div key={l}><div style={{fontSize:8,color:"#64748b",textTransform:"uppercase"}}>{l}</div><div style={{fontSize:12,fontWeight:700,color:"#e2e8f0"}}>{v}</div></div>))}</div></div>
-        </div>
-        <button onClick={doSim} disabled={simRunning||!players.length} style={{...S.btnRun,opacity:(simRunning||!players.length)?0.6:1}}>{simRunning?"⏳ Running...":"▶ Run "+simCount.toLocaleString()+" Simulations"}</button>
-      </div>}
+    {/* RESULTS */}
+    {tab==="results"&&simRes&&<div style={S.panel}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><div><h2 style={S.h2}>Results</h2><p style={S.help}>{simCount.toLocaleString()} sims · ±95% CI · Click row to expand</p></div><button onClick={csvRes} style={S.btnSm}>⬇ CSV</button></div>
+      <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left",cursor:"pointer"}} onClick={()=>tSort("name","asc")}>Player</th>{[["sim_win","Win%"],["sim_top5","Top 5"],["sim_top10","Top 10"],["sim_top20","Top 20"],["sim_make_cut","Cut"],["avg_finish","Avg Pos"],["dg_win","DG Win%"]].map(([c,l])=>(<th key={c} style={{...S.th,cursor:"pointer"}} onClick={()=>tSort(c,c==="avg_finish"?"asc":"desc")}>{l}{sort.col===c?" "+(sort.dir==="asc"?"↑":"↓"):""}</th>))}</tr></thead><tbody>
+        {sorted.slice(0,100).map((p,i)=>{const isExp=expanded===p.id;return(<React.Fragment key={p.id}><tr style={{...(i%2?S.trO:S.trE),cursor:"pointer"}} onClick={()=>setExpanded(isExp?null:p.id)}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{p.name} <span style={{color:isExp?"#22d3ee":"#334155",fontSize:9}}>{isExp?"▼":"▶"}</span></td><td style={S.tdH}>{pFmt(p.sim_win)}<br/><span style={{fontSize:8,color:"#64748b"}}>±{(ci95(p.sim_win,simCount)*100).toFixed(2)}%</span></td><td style={S.td}>{pFmt(p.sim_top5)}<br/><span style={{fontSize:8,color:"#64748b"}}>±{(ci95(p.sim_top5,simCount)*100).toFixed(2)}%</span></td><td style={S.td}>{pFmt(p.sim_top10)}</td><td style={S.td}>{pFmt(p.sim_top20)}</td><td style={S.td}>{pFmt(p.sim_make_cut)}</td><td style={S.td}>{p.avg_finish?.toFixed(1)}</td><td style={S.tdD}>{p.dg_win>0?pFmt(p.dg_win):"-"}</td></tr>
+          {isExp&&<tr><td colSpan={9} style={{padding:0,borderBottom:"2px solid #22d3ee33"}}><PlayerCard player={p} n={simCount} bankroll={bankroll} kellyFrac={kellyFrac}/></td></tr>}</React.Fragment>);})}
+      </tbody></table></div></div>}
 
-      {tab==="results"&&simRes&&<div style={S.panel}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-          <div><h2 style={S.h2}>Simulation Results</h2><p style={S.help}>{simCount.toLocaleString()} sims · ±95% CI on Win% and Top 5% · Click any row to expand detail card</p></div>
-          <button onClick={csvRes} style={S.btnSm}>⬇ CSV</button>
-        </div>
-        <div style={S.tW}><table style={S.table}><thead><tr>
-          <th style={S.th}>#</th><th style={{...S.th,textAlign:"left",cursor:"pointer"}} onClick={()=>tSort("name","asc")}>Player</th>
-          {[["sim_win","Win%"],["sim_top5","Top 5"],["sim_top10","Top 10"],["sim_top20","Top 20"],["sim_make_cut","Cut"],["avg_finish","Avg Pos"],["dg_win","DG Win%"]].map(([c,l])=>(
-            <th key={c} style={{...S.th,cursor:"pointer"}} onClick={()=>tSort(c,c==="avg_finish"?"asc":"desc")}>{l}{sort.col===c?" "+(sort.dir==="asc"?"↑":"↓"):""}</th>
-          ))}
-        </tr></thead><tbody>
-          {sorted.slice(0,100).map((p,i)=>{const isExp=expanded===p.id;return(<React.Fragment key={p.id}>
-            <tr style={{...(i%2?S.trO:S.trE),cursor:"pointer"}} onClick={()=>setExpanded(isExp?null:p.id)}>
-              <td style={S.tdR}>{i+1}</td>
-              <td style={S.tdN}>{p.name} <span style={{color:isExp?"#22d3ee":"#334155",fontSize:9}}>{isExp?"▼":"▶"}</span></td>
-              <td style={S.tdH}>{pFmt(p.sim_win)}<br/><span style={{fontSize:8,color:"#64748b"}}>±{(ci95(p.sim_win,simCount)*100).toFixed(2)}%</span></td>
-              <td style={S.td}>{pFmt(p.sim_top5)}<br/><span style={{fontSize:8,color:"#64748b"}}>±{(ci95(p.sim_top5,simCount)*100).toFixed(2)}%</span></td>
-              <td style={S.td}>{pFmt(p.sim_top10)}</td><td style={S.td}>{pFmt(p.sim_top20)}</td><td style={S.td}>{pFmt(p.sim_make_cut)}</td>
-              <td style={S.td}>{p.avg_finish?.toFixed(1)}</td><td style={S.tdD}>{p.dg_win>0?pFmt(p.dg_win):"-"}</td>
-            </tr>
-            {isExp&&<tr><td colSpan={9} style={{padding:0,borderBottom:"2px solid #22d3ee33"}}><PlayerCard player={p} n={simCount} bankroll={bankroll} kellyFrac={kellyFrac}/></td></tr>}
-          </React.Fragment>);})}
-        </tbody></table></div>
-      </div>}
+    {/* EV */}
+    {tab==="ev"&&simRes&&<div style={S.panel}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:8}}><h2 style={S.h2}>Expected Value</h2><div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}><span style={{fontSize:10,color:"#94a3b8"}}>Bankroll $</span><input type="number" value={bankroll} onChange={e=>setBankroll(+e.target.value)} style={{...S.inp,width:85,padding:"4px 7px",fontSize:11}} min={0}/><select value={kellyFrac} onChange={e=>setKellyFrac(+e.target.value)} style={{...S.inp,width:95,padding:"4px 7px",fontSize:11}}><option value={0.25}>¼ Kelly</option><option value={0.5}>½ Kelly</option><option value={1}>Full Kelly</option></select><button onClick={csvEV} style={S.btnSm}>⬇ CSV</button></div></div>
+      {!hasOdds&&<div style={S.warn}><b>No DraftKings odds loaded.</b></div>}
+      {hasOdds&&<React.Fragment><p style={S.help}>EV = Sim% − implied%. <span style={{color:"#22c55e"}}>Green = edge.</span></p>
+        <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player</th>{dSt.odds.flatMap(m=>[<th key={m+"_ev"} style={{...S.th,cursor:"pointer",color:"#22d3ee"}} onClick={()=>setEvS(s=>s.col==="ev_"+m?{...s,dir:s.dir==="desc"?"asc":"desc"}:{col:"ev_"+m,dir:"desc"})}>{MARKET_LABELS[m]} EV{evS.col==="ev_"+m?(evS.dir==="asc"?" ↑":" ↓"):""}</th>,<th key={m+"_s"} style={S.th}>Sim%</th>,<th key={m+"_o"} style={S.th}>Odds</th>,<th key={m+"_k"} style={{...S.th,color:"#22d3ee"}}>Kelly $</th>])}</tr></thead><tbody>
+          {evData.filter(p=>MARKETS.some(m=>p["ev_"+m]!=null)).slice(0,100).map((p,i)=>(<tr key={p.id} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{p.name}</td>{dSt.odds.flatMap(m=>{const ev=p["ev_"+m],k=p["kelly_"+m];return[<td key={"e"+m} style={{...S.td,fontWeight:700,color:(ev||0)>0.01?"#22c55e":(ev||0)<-0.02?"#ef4444":"#94a3b8"}}>{evFmt(ev)}</td>,<td key={"s"+m} style={S.td}>{pFmt(p["sim_"+m])}</td>,<td key={"o"+m} style={S.td}>{p["odds_"+m]?p["odds_"+m].toFixed(2):"-"}</td>,<td key={"k"+m} style={{...S.td,color:k>0?"#22d3ee":"#334155"}}>{k>0?"$"+k.toFixed(2):"-"}</td>];})}</tr>))}
+        </tbody></table></div></React.Fragment>}
+    </div>}
 
-      {tab==="ev"&&simRes&&<div style={S.panel}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:8}}>
-          <h2 style={S.h2}>Expected Value Analysis</h2>
-          <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
-            <span style={{fontSize:10,color:"#94a3b8"}}>Bankroll $</span>
-            <input type="number" value={bankroll} onChange={e=>setBankroll(+e.target.value)} style={{...S.inp,width:85,padding:"4px 7px",fontSize:11}} min={0}/>
-            <select value={kellyFrac} onChange={e=>setKellyFrac(+e.target.value)} style={{...S.inp,width:95,padding:"4px 7px",fontSize:11}}><option value={0.25}>¼ Kelly</option><option value={0.5}>½ Kelly</option><option value={1}>Full Kelly</option></select>
-            <button onClick={csvEV} style={S.btnSm}>⬇ CSV</button>
-          </div>
-        </div>
-        {!hasOdds&&<div style={S.warn}><b>No DraftKings odds loaded.</b> Import odds from DataGolf's betting-tools/outrights endpoint (Setup tab).</div>}
-        {hasOdds&&<React.Fragment>
-          <p style={S.help}>EV = Sim% − DK implied%. <span style={{color:"#22c55e"}}>Green = edge.</span> Markets loaded: <b>{dSt.odds.map(m=>MARKET_LABELS[m]).join(", ")}</b></p>
-          <div style={S.tW}><table style={S.table}><thead><tr>
-            <th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player</th>
-            {dSt.odds.flatMap(m=>[
-              <th key={m+"_ev"} style={{...S.th,cursor:"pointer",color:"#22d3ee"}} onClick={()=>setEvS(s=>s.col==="ev_"+m?{...s,dir:s.dir==="desc"?"asc":"desc"}:{col:"ev_"+m,dir:"desc"})}>{MARKET_LABELS[m]} EV{evS.col==="ev_"+m?(evS.dir==="asc"?" ↑":" ↓"):""}</th>,
-              <th key={m+"_sim"} style={S.th}>Sim%</th>,
-              <th key={m+"_odds"} style={S.th}>DK Odds</th>,
-              <th key={m+"_kelly"} style={{...S.th,color:"#22d3ee"}}>Kelly $</th>,
-            ])}
-          </tr></thead><tbody>
-            {evData.filter(p=>MARKETS.some(m=>p["ev_"+m]!=null)).slice(0,100).map((p,i)=>(<tr key={p.id} style={i%2?S.trO:S.trE}>
-              <td style={S.tdR}>{i+1}</td><td style={S.tdN}>{p.name}</td>
-              {dSt.odds.flatMap(m=>{const ev=p["ev_"+m],k=p["kelly_"+m];return[
-                <td key={"e"+m} style={{...S.td,fontWeight:700,color:(ev||0)>0.01?"#22c55e":(ev||0)<-0.02?"#ef4444":"#94a3b8"}}>{evFmt(ev)}</td>,
-                <td key={"s"+m} style={S.td}>{pFmt(p["sim_"+m])}</td>,
-                <td key={"o"+m} style={S.td}>{p["odds_"+m]?p["odds_"+m].toFixed(2):"-"}</td>,
-                <td key={"k"+m} style={{...S.td,color:k>0?"#22d3ee":"#334155"}}>{k>0?"$"+k.toFixed(2):"-"}</td>,
-              ];})}
-            </tr>))}
-          </tbody></table></div>
-        </React.Fragment>}
-      </div>}
+    {/* MATCHUPS */}
+    {tab==="matchups"&&simRes&&<div style={S.panel}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:8}}><h2 style={S.h2}>72-Hole Matchup EV</h2><div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{fontSize:10,color:"#94a3b8"}}>Bankroll $</span><input type="number" value={bankroll} onChange={e=>setBankroll(+e.target.value)} style={{...S.inp,width:85,padding:"4px 7px",fontSize:11}} min={0}/><select value={kellyFrac} onChange={e=>setKellyFrac(+e.target.value)} style={{...S.inp,width:95,padding:"4px 7px",fontSize:11}}><option value={0.25}>¼ Kelly</option><option value={0.5}>½ Kelly</option><option value={1}>Full Kelly</option></select></div></div>
+      {!h2hData&&<div style={S.warn}>Re-run with ≤{MAX_STORE.toLocaleString()} sims.</div>}
+      {h2hData&&!matchupRows.length&&<div style={S.warn}>No matchup pairs found.</div>}
+      {h2hData&&matchupRows.length>0&&<React.Fragment><p style={S.help}>{matchupRows.length} pairs · sorted by best EV.</p>
+        <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player 1</th><th style={S.th}>Sim%</th><th style={S.th}>DK</th><th style={S.th}>Imp%</th><th style={{...S.th,color:"#22d3ee"}}>EV</th><th style={{...S.th,color:"#22d3ee"}}>Kelly</th><th style={{...S.th,textAlign:"left"}}>Player 2</th><th style={S.th}>Sim%</th><th style={S.th}>DK</th><th style={S.th}>Imp%</th><th style={{...S.th,color:"#22d3ee"}}>EV</th><th style={{...S.th,color:"#22d3ee"}}>Kelly</th></tr></thead><tbody>
+          {matchupRows.slice(0,100).map((m,i)=>(<tr key={i} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{m.name1}</td><td style={S.td}>{m.s1!=null?pFmtS(m.s1):"-"}</td><td style={S.td}>{m.dk1>1?m.dk1.toFixed(2):"-"}</td><td style={S.tdD}>{m.i1>0?pFmtS(m.i1):"-"}</td><td style={{...S.td,fontWeight:700,color:(m.ev1||0)>0.01?"#22c55e":(m.ev1||0)<-0.02?"#ef4444":"#94a3b8"}}>{evFmt(m.ev1)}</td><td style={{...S.td,color:m.k1>0?"#22d3ee":"#334155"}}>{m.k1>0?"$"+m.k1.toFixed(2):"-"}</td><td style={S.tdN}>{m.name2}</td><td style={S.td}>{m.s2!=null?pFmtS(m.s2):"-"}</td><td style={S.td}>{m.dk2>1?m.dk2.toFixed(2):"-"}</td><td style={S.tdD}>{m.i2>0?pFmtS(m.i2):"-"}</td><td style={{...S.td,fontWeight:700,color:(m.ev2||0)>0.01?"#22c55e":(m.ev2||0)<-0.02?"#ef4444":"#94a3b8"}}>{evFmt(m.ev2)}</td><td style={{...S.td,color:m.k2>0?"#22d3ee":"#334155"}}>{m.k2>0?"$"+m.k2.toFixed(2):"-"}</td></tr>))}
+        </tbody></table></div></React.Fragment>}
+    </div>}
 
-      {tab==="matchups"&&simRes&&<div style={S.panel}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:8}}>
-          <h2 style={S.h2}>72-Hole Matchup EV</h2>
-          <div style={{display:"flex",gap:6,alignItems:"center"}}>
-            <span style={{fontSize:10,color:"#94a3b8"}}>Bankroll $</span>
-            <input type="number" value={bankroll} onChange={e=>setBankroll(+e.target.value)} style={{...S.inp,width:85,padding:"4px 7px",fontSize:11}} min={0}/>
-            <select value={kellyFrac} onChange={e=>setKellyFrac(+e.target.value)} style={{...S.inp,width:95,padding:"4px 7px",fontSize:11}}><option value={0.25}>¼ Kelly</option><option value={0.5}>½ Kelly</option><option value={1}>Full Kelly</option></select>
-          </div>
-        </div>
-        {!h2hData&&<div style={S.warn}>Per-sim scores not stored. Re-run simulation with ≤{MAX_STORE.toLocaleString()} iterations to enable H2H analysis.</div>}
-        {h2hData&&!matchupRows.length&&<div style={S.warn}>No matchup pairs with DK odds found. Import from: <code style={{color:"#22d3ee"}}>/betting-tools/matchups?tour=pga&market=tournament_matchups&odds_format=decimal</code></div>}
-        {h2hData&&matchupRows.length>0&&<React.Fragment>
-          <p style={S.help}>Sim win% vs DK implied%. <span style={{color:"#22c55e"}}>Green = edge.</span> {matchupRows.length} pairs · sorted by best EV side.</p>
-          <div style={S.tW}><table style={S.table}><thead><tr>
-            <th style={S.th}>#</th>
-            <th style={{...S.th,textAlign:"left"}}>Player 1</th><th style={S.th}>Sim%</th><th style={S.th}>DK Odds</th><th style={S.th}>Imp%</th><th style={{...S.th,color:"#22d3ee"}}>EV</th><th style={{...S.th,color:"#22d3ee"}}>Kelly $</th>
-            <th style={{...S.th,textAlign:"left"}}>Player 2</th><th style={S.th}>Sim%</th><th style={S.th}>DK Odds</th><th style={S.th}>Imp%</th><th style={{...S.th,color:"#22d3ee"}}>EV</th><th style={{...S.th,color:"#22d3ee"}}>Kelly $</th>
-          </tr></thead><tbody>
-            {matchupRows.slice(0,100).map((m,i)=>(<tr key={i} style={i%2?S.trO:S.trE}>
-              <td style={S.tdR}>{i+1}</td>
-              <td style={S.tdN}>{m.name1}</td><td style={S.td}>{m.s1!=null?pFmtS(m.s1):"-"}</td><td style={S.td}>{m.dk1>1?m.dk1.toFixed(2):"-"}</td><td style={S.tdD}>{m.i1>0?pFmtS(m.i1):"-"}</td>
-              <td style={{...S.td,fontWeight:700,color:(m.ev1||0)>0.01?"#22c55e":(m.ev1||0)<-0.02?"#ef4444":"#94a3b8"}}>{evFmt(m.ev1)}</td>
-              <td style={{...S.td,color:m.k1>0?"#22d3ee":"#334155"}}>{m.k1>0?"$"+m.k1.toFixed(2):"-"}</td>
-              <td style={S.tdN}>{m.name2}</td><td style={S.td}>{m.s2!=null?pFmtS(m.s2):"-"}</td><td style={S.td}>{m.dk2>1?m.dk2.toFixed(2):"-"}</td><td style={S.tdD}>{m.i2>0?pFmtS(m.i2):"-"}</td>
-              <td style={{...S.td,fontWeight:700,color:(m.ev2||0)>0.01?"#22c55e":(m.ev2||0)<-0.02?"#ef4444":"#94a3b8"}}>{evFmt(m.ev2)}</td>
-              <td style={{...S.td,color:m.k2>0?"#22d3ee":"#334155"}}>{m.k2>0?"$"+m.k2.toFixed(2):"-"}</td>
-            </tr>))}
-          </tbody></table></div>
-        </React.Fragment>}
-      </div>}
+    {/* GRADING */}
+    {tab==="grading"&&<div style={S.panel}><h2 style={S.h2}>Post-Tournament Grading</h2><p style={S.help}>Compare projections against actual results and see what SG categories mattered.</p>
+      <div style={S.section}><h3 style={S.h3}>Select Simulation</h3><select value={gradingSim?.id||""} onChange={e=>{const h=hist.find(x=>x.id===+e.target.value);setGradingSim(h||null);}} style={{...S.inp,maxWidth:500,marginBottom:10}}><option value="">Choose...</option>{hist.map(h=><option key={h.id} value={h.id}>{h.t} — {new Date(h.date).toLocaleDateString()} — {h.n?.toLocaleString()} sims</option>)}</select>
+        {gradingSim&&<div style={{padding:8,background:"#0f172a",borderRadius:5,fontSize:10,color:"#94a3b8",marginBottom:10}}><b style={{color:"#22d3ee"}}>{gradingSim.t}</b> · {gradingSim.n?.toLocaleString()} sims · D:{gradingSim.sg?.dist}% Ac:{gradingSim.sg?.acc}% Ap:{gradingSim.sg?.app}% AR:{gradingSim.sg?.arg}% P:{gradingSim.sg?.putt}%</div>}</div>
+      <div style={S.section}><h3 style={S.h3}>Fetch Actual Results</h3><div style={{display:"flex",gap:6,alignItems:"center",marginBottom:10,flexWrap:"wrap"}}>
+          {!eventList&&<button onClick={fetchEventList} disabled={eventListLoading} style={{...S.btnSm,background:"#1e293b",color:"#94a3b8",border:"1px solid #334155"}}>{eventListLoading?"Loading events...":"Load Event List"}</button>}
+          {eventList&&<select value={gradeEventId?gradeEventId+"|"+gradeYear:""} onChange={e=>handleGradeEventSelect(e.target.value)} style={{...S.inp,maxWidth:400}}>
+            <option value="">Select completed tournament...</option>
+            {eventList.map((ev,i)=><option key={i} value={(ev.event_id||"")+"|"+(ev.calendar_year||"")}>{ev.event_name||ev.event_id} — {ev.calendar_year}{ev.course?" · "+ev.course:""}</option>)}
+          </select>}
+          <button onClick={fetchGradeResults} disabled={gradeLoading||!gradeEventId} style={{...S.btnP,opacity:gradeLoading||!gradeEventId?0.5:1}}>{gradeLoading?"⏳":"Fetch Results"}</button></div>{gradeStatus&&<div style={{fontSize:11,color:gradeStatus.startsWith("✓")?"#22c55e":"#94a3b8",marginBottom:10}}>{gradeStatus}</div>}</div>
 
-      {tab==="history"&&<div style={S.panel}>
-        <h2 style={S.h2}>Simulation History</h2>
-        {compareItems.length>0&&<div style={{marginBottom:10,padding:"8px 12px",background:"#0f172a",border:"1px solid #334155",borderRadius:5,display:"flex",alignItems:"center",gap:8}}>
-          <span style={{fontSize:11,color:"#94a3b8"}}>{compareItems.length===1?"Select one more sim to compare":"Ready to compare"}</span>
-          {compareData&&<button onClick={()=>setShowCompare(s=>!s)} style={{...S.btnSm,fontSize:9}}>{showCompare?"Hide":"Show Compare"}</button>}
-          <button onClick={()=>{setCompareItems([]);setShowCompare(false);}} style={{...S.preDel,fontSize:10}}>Clear</button>
-        </div>}
-        {showCompare&&compareData&&<div style={{marginBottom:16,border:"1px solid #1e293b",borderRadius:6,overflow:"hidden"}}>
-          <div style={{padding:"8px 12px",background:"#0f172a",display:"grid",gridTemplateColumns:"1fr auto 1fr",gap:8,fontSize:10}}>
-            <div><span style={{color:"#22d3ee"}}>A: {new Date(compareData.a.date).toLocaleDateString()}</span> · {compareData.a.n?.toLocaleString()} sims · Dist:{compareData.a.sg?.dist}% Acc:{compareData.a.sg?.acc}% App:{compareData.a.sg?.app}% ARG:{compareData.a.sg?.arg}% Putt:{compareData.a.sg?.putt}%</div>
-            <div style={{color:"#475569",alignSelf:"center"}}>vs</div>
-            <div style={{textAlign:"right"}}><span style={{color:"#f59e0b"}}>B: {new Date(compareData.b.date).toLocaleDateString()}</span> · {compareData.b.n?.toLocaleString()} sims · Dist:{compareData.b.sg?.dist}% Acc:{compareData.b.sg?.acc}% App:{compareData.b.sg?.app}% ARG:{compareData.b.sg?.arg}% Putt:{compareData.b.sg?.putt}%</div>
-          </div>
-          <div style={S.tW}><table style={S.table}><thead><tr>
-            <th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player</th>
-            <th style={{...S.th,color:"#22d3ee"}}>A Win%</th><th style={{...S.th,color:"#f59e0b"}}>B Win%</th><th style={S.th}>Δ Win%</th>
-            <th style={{...S.th,color:"#22d3ee"}}>A Top5%</th><th style={{...S.th,color:"#f59e0b"}}>B Top5%</th><th style={S.th}>Δ Top5%</th>
-          </tr></thead><tbody>
-            {compareData.rows.map((r,i)=>(<tr key={r.name} style={i%2?S.trO:S.trE}>
-              <td style={S.tdR}>{i+1}</td><td style={S.tdN}>{r.name}</td>
-              <td style={{...S.td,color:"#22d3ee"}}>{pFmt(r.aW)}</td><td style={{...S.td,color:"#f59e0b"}}>{pFmt(r.bW)}</td>
-              <td style={{...S.td,fontWeight:700,color:r.dW>0.002?"#22c55e":r.dW<-0.002?"#ef4444":"#94a3b8"}}>{r.dW>0?"+":""}{(r.dW*100).toFixed(2)}%</td>
-              <td style={{...S.td,color:"#22d3ee"}}>{pFmt(r.aT5)}</td><td style={{...S.td,color:"#f59e0b"}}>{pFmt(r.bT5)}</td>
-              <td style={{...S.td,fontWeight:700,color:r.dT5>0.005?"#22c55e":r.dT5<-0.005?"#ef4444":"#94a3b8"}}>{r.dT5>0?"+":""}{(r.dT5*100).toFixed(2)}%</td>
-            </tr>))}
-          </tbody></table></div>
-        </div>}
-        {!hist.length&&<div style={S.empty}>No simulations run yet.</div>}
-        {hist.map(h=>{const isSel=compareItems.includes(h.id);const si=compareItems.indexOf(h.id);return(<div key={h.id} style={{...S.hCard,borderLeft:"3px solid "+(isSel?(si===0?"#22d3ee":"#f59e0b"):"#1e293b")}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
-            <span style={{fontSize:13,fontWeight:700,color:"#e2e8f0"}}>{h.t||"Tournament"}</span>
-            <div style={{display:"flex",gap:4}}>
-              <button onClick={()=>toggleCmp(h.id)} style={{...S.btnSm,fontSize:9,background:isSel?"#1e3a5f":"#1e293b",color:isSel?(si===0?"#22d3ee":"#f59e0b"):"#94a3b8",border:"1px solid "+(isSel?"#0e7490":"#334155")}}>{isSel?"✓ Sim "+(si===0?"A":"B"):"Compare"}</button>
-              <button onClick={()=>{setSgW(h.sg);setCtxW(h.cx);setTab("weights");}} style={{...S.btnSm,fontSize:9}}>↺ Reload Weights</button>
-            </div>
-          </div>
-          <div style={{fontSize:10,color:"#64748b",marginBottom:5}}>{new Date(h.date).toLocaleString()} · {h.n?.toLocaleString()} sims · Dist:{h.sg?.dist}% Acc:{h.sg?.acc}% App:{h.sg?.app}% ARG:{h.sg?.arg}% Putt:{h.sg?.putt}% · Hx:{h.cx?.ch}% Fit:{h.cx?.cf}% Form:{h.cx?.rf}%</div>
-          <div style={{display:"flex",flexWrap:"wrap",gap:4}}>{h.top30?.slice(0,5).map((t,j)=>(<span key={j} style={S.hP}>{j+1}. {t.n} ({(t.w*100).toFixed(1)}%)</span>))}</div>
-        </div>);})}
-      </div>}
-    </div>
-  );
+      {gradingSim&&gradeResults&&(()=>{const simMap={};gradingSim.top30?.forEach(p=>simMap[p.id||p.n]=p);const matched=gradeResults.filter(r=>simMap[r.pid]||simMap[r.name]).map(r=>{const sp=simMap[r.pid]||simMap[r.name];return{name:r.name,finish:r.finish,simWin:sp?.w||0,simT5:sp?.t5||0,simT10:sp?.t10||0,simT20:sp?.t20||0};}).sort((a,b)=>a.finish-b.finish);
+        const corr=matched.length>=5?spearmanCorr(matched.map(m=>m.simWin),matched.map(m=>m.finish)):null;
+        const best=matched.filter(m=>m.simWin>0&&m.finish<=10).sort((a,b)=>b.simWin-a.simWin).slice(0,3);
+        const worst=matched.filter(m=>m.simWin>0.01&&m.finish>50).slice(0,3);
+        return<div style={S.section}><h3 style={S.h3}>📊 Projection vs Actual</h3>
+          {corr!=null&&<div style={{padding:10,background:"#0f172a",borderRadius:6,marginBottom:12,display:"flex",gap:16,flexWrap:"wrap"}}><div><div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Rank Correlation</div><div style={{fontSize:20,fontWeight:700,color:corr<-0.3?"#22c55e":corr<-0.1?"#f59e0b":"#ef4444"}}>{corr.toFixed(3)}</div></div>
+            {best.length>0&&<div><div style={{fontSize:9,color:"#22c55e",textTransform:"uppercase",marginBottom:3}}>Best Calls</div>{best.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1"}}>{m.name}: {pFmtS(m.simWin)} → #{m.finish}</div>)}</div>}
+            {worst.length>0&&<div><div style={{fontSize:9,color:"#ef4444",textTransform:"uppercase",marginBottom:3}}>Worst Calls</div>{worst.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1"}}>{m.name}: {pFmtS(m.simWin)} → #{m.finish}</div>)}</div>}</div>}
+          <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>Finish</th><th style={{...S.th,textAlign:"left"}}>Player</th><th style={S.th}>Sim Win%</th><th style={S.th}>Sim T5%</th><th style={S.th}>Sim T10%</th><th style={S.th}>Sim T20%</th></tr></thead><tbody>
+            {matched.slice(0,50).map((m,i)=>(<tr key={m.name} style={i%2?S.trO:S.trE}><td style={{...S.td,fontWeight:700,color:m.finish<=5?"#22c55e":m.finish<=20?"#22d3ee":"#94a3b8"}}>{m.finish}</td><td style={S.tdN}>{m.name}</td><td style={S.td}>{pFmtS(m.simWin)}</td><td style={S.td}>{pFmtS(m.simT5)}</td><td style={S.td}>{pFmtS(m.simT10)}</td><td style={S.td}>{pFmtS(m.simT20)}</td></tr>))}
+          </tbody></table></div></div>;})()}
+
+      {gradeCorr&&<div style={S.section}><h3 style={S.h3}>🎯 What Mattered This Week</h3><p style={{fontSize:10,color:"#64748b",marginBottom:10}}>SG correlation to finish. n={gradeCorr.n}.</p>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:18}}><div>{gradeCorr.corrs.map(c=><CorrBar key={c.k} val={c.corr} label={c.l}/>)}</div>
+          <div style={{padding:14,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:12,fontWeight:700,color:"#f59e0b",marginBottom:8}}>Optimal Weights</div>
+            {gradeCorr.corrs.map(c=>(<div key={c.k} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid #1e293b"}}><span style={{fontSize:11,color:"#cbd5e1"}}>{c.l}</span><span style={{fontSize:13,fontWeight:700,color:"#f59e0b"}}>{c.suggestedPct}%</span></div>))}
+            {gradingSim&&<div style={{marginTop:12,fontSize:10,color:"#64748b"}}><b style={{color:"#94a3b8"}}>Your weights:</b> D:{gradingSim.sg?.dist}% Ac:{gradingSim.sg?.acc}% Ap:{gradingSim.sg?.app}% AR:{gradingSim.sg?.arg}% P:{gradingSim.sg?.putt}%</div>}
+          </div></div></div>}
+    </div>}
+
+    {/* HISTORY */}
+    {tab==="history"&&<div style={S.panel}><h2 style={S.h2}>Simulation History</h2>
+      {compareItems.length>0&&<div style={{marginBottom:10,padding:"8px 12px",background:"#0f172a",border:"1px solid #334155",borderRadius:5,display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:11,color:"#94a3b8"}}>{compareItems.length===1?"Select one more":"Ready"}</span>{compareData&&<button onClick={()=>setShowCompare(s=>!s)} style={{...S.btnSm,fontSize:9}}>{showCompare?"Hide":"Show"}</button>}<button onClick={()=>{setCompareItems([]);setShowCompare(false);}} style={{...S.preDel,fontSize:10}}>Clear</button></div>}
+      {showCompare&&compareData&&<div style={{marginBottom:16,border:"1px solid #1e293b",borderRadius:6,overflow:"hidden"}}><div style={{padding:"8px 12px",background:"#0f172a",display:"grid",gridTemplateColumns:"1fr auto 1fr",gap:8,fontSize:10}}><div><span style={{color:"#22d3ee"}}>A</span> · {compareData.a.n?.toLocaleString()} sims</div><div style={{color:"#475569"}}>vs</div><div style={{textAlign:"right"}}><span style={{color:"#f59e0b"}}>B</span> · {compareData.b.n?.toLocaleString()} sims</div></div>
+        <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player</th><th style={{...S.th,color:"#22d3ee"}}>A Win%</th><th style={{...S.th,color:"#f59e0b"}}>B Win%</th><th style={S.th}>Δ</th><th style={{...S.th,color:"#22d3ee"}}>A T5%</th><th style={{...S.th,color:"#f59e0b"}}>B T5%</th><th style={S.th}>Δ</th></tr></thead><tbody>
+          {compareData.rows.map((r,i)=>(<tr key={r.name} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{r.name}</td><td style={{...S.td,color:"#22d3ee"}}>{pFmt(r.aW)}</td><td style={{...S.td,color:"#f59e0b"}}>{pFmt(r.bW)}</td><td style={{...S.td,fontWeight:700,color:r.dW>0.002?"#22c55e":r.dW<-0.002?"#ef4444":"#94a3b8"}}>{r.dW>0?"+":""}{(r.dW*100).toFixed(2)}%</td><td style={{...S.td,color:"#22d3ee"}}>{pFmt(r.aT5)}</td><td style={{...S.td,color:"#f59e0b"}}>{pFmt(r.bT5)}</td><td style={{...S.td,fontWeight:700,color:r.dT5>0.005?"#22c55e":r.dT5<-0.005?"#ef4444":"#94a3b8"}}>{r.dT5>0?"+":""}{(r.dT5*100).toFixed(2)}%</td></tr>))}
+        </tbody></table></div></div>}
+      {!hist.length&&<div style={S.empty}>No simulations yet.</div>}
+      {hist.map(h=>{const isSel=compareItems.includes(h.id);const si=compareItems.indexOf(h.id);return(<div key={h.id} style={{...S.hCard,borderLeft:"3px solid "+(isSel?(si===0?"#22d3ee":"#f59e0b"):"#1e293b")}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}><span style={{fontSize:13,fontWeight:700,color:"#e2e8f0"}}>{h.t||"Tournament"}</span><div style={{display:"flex",gap:4}}><button onClick={()=>toggleCmp(h.id)} style={{...S.btnSm,fontSize:9,background:isSel?"#1e3a5f":"#1e293b",color:isSel?(si===0?"#22d3ee":"#f59e0b"):"#94a3b8"}}>{isSel?"✓ "+(si===0?"A":"B"):"Compare"}</button><button onClick={()=>{setSgW(h.sg);setCtxW(prev=>({...prev,...h.cx}));setTab("weights");}} style={{...S.btnSm,fontSize:9}}>↺ Reload</button></div></div>
+        <div style={{fontSize:10,color:"#64748b",marginBottom:5}}>{new Date(h.date).toLocaleString()} · {h.n?.toLocaleString()} sims · D:{h.sg?.dist}% Ac:{h.sg?.acc}% Ap:{h.sg?.app}% AR:{h.sg?.arg}% P:{h.sg?.putt}%</div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:4}}>{h.top30?.slice(0,5).map((t,j)=>(<span key={j} style={S.hP}>{j+1}. {t.n} ({(t.w*100).toFixed(1)}%)</span>))}</div></div>);})}
+    </div>}
+  </div>);
 }
 
+/* ── PlayerCard ── */
 function PlayerCard({player:p,n,bankroll,kellyFrac}){
   const smk={win:"sim_win",top_5:"sim_top5",top_10:"sim_top10",top_20:"sim_top20",make_cut:"sim_make_cut"};
-  const sgVals=[p.sg_dist,p.sg_acc,p.sg_app,p.sg_arg,p.sg_putt].map(v=>v||0);
-  const sgMax=Math.max(...sgVals.map(Math.abs),0.05);
-  const bar=(v)=><div style={{display:"flex",alignItems:"center",gap:6}}>
-    <div style={{width:55,textAlign:"right",fontSize:10,color:"#94a3b8"}}>{v>0?"+":""}{(v||0).toFixed(3)}</div>
-    <div style={{flex:1,height:7,background:"#1e293b",borderRadius:4,overflow:"hidden"}}><div style={{width:Math.abs(v/sgMax*100)+"%",height:"100%",background:v>=0?"#22c55e":"#ef4444",borderRadius:4}}/></div>
-  </div>;
-  return <div style={{padding:"14px 18px",background:"#090d14",display:"grid",gridTemplateColumns:"1fr 1fr",gap:18}}>
-    <div>
-      <div style={{fontSize:12,fontWeight:700,color:"#22d3ee",marginBottom:8}}>{p.name} — Strokes Gained Profile</div>
-      {[["Drv Distance",p.sg_dist],["Drv Accuracy",p.sg_acc],["Approach",p.sg_app],["Around Green",p.sg_arg],["Putting",p.sg_putt]].map(([l,v])=>(
-        <div key={l} style={{marginBottom:6}}><div style={{fontSize:9,color:"#64748b",marginBottom:2,textTransform:"uppercase"}}>{l}</div>{bar(v||0)}</div>
-      ))}
-      <div style={{marginTop:10,fontSize:10,color:"#64748b"}}>Baseline: <b style={{color:"#e2e8f0"}}>{p.baseline?.toFixed(4)||"—"}</b> · CH: <b style={{color:"#e2e8f0"}}>{(p.course_history_adj||0).toFixed(4)}</b> · Fit: <b style={{color:"#e2e8f0"}}>{(p.course_fit_adj||0).toFixed(4)}</b> · Form: <b style={{color:"#e2e8f0"}}>{(p.recent_form_adj||0).toFixed(4)}</b></div>
-    </div>
-    <div>
-      <div style={{fontSize:12,fontWeight:700,color:"#22d3ee",marginBottom:8}}>Sim Probabilities & DK Odds</div>
-      {MARKETS.map(m=>{
-        const sp=p[smk[m]]||0,od=p.playerOdds?.[m],ciVal=ci95(sp,n);
-        const imp=od?.bestOdds>1?decToImp(od.bestOdds):null;
-        const ev=imp!=null?sp-imp:null;
-        const kb=ev!=null&&ev>0&&od?.bestOdds>1?kellyBet(sp,od.bestOdds,kellyFrac,bankroll):0;
-        return <div key={m} style={{marginBottom:7,padding:"6px 9px",background:"#0f172a",borderRadius:4}}>
-          <div style={{display:"flex",justifyContent:"space-between"}}>
-            <span style={{fontSize:10,fontWeight:600,color:"#cbd5e1"}}>{MARKET_LABELS[m]}</span>
-            <span style={{fontSize:11,fontWeight:700,color:"#22d3ee"}}>{pFmt(sp)}</span>
-          </div>
-          <div style={{fontSize:9,color:"#64748b",marginTop:1}}>95% CI: [{pFmt(Math.max(0,sp-ciVal))}, {pFmt(Math.min(1,sp+ciVal))}]</div>
-          {od&&<div style={{fontSize:9,marginTop:3,display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:4}}>
-            <span style={{color:"#475569"}}>DK {od.bestOdds.toFixed(2)} (imp {pFmt(imp)})</span>
-            <span style={{fontWeight:700,color:ev>0.01?"#22c55e":ev<-0.02?"#ef4444":"#64748b"}}>{evFmt(ev)}{kb>0?" · $"+kb.toFixed(2):""}</span>
-          </div>}
-        </div>;
-      })}
-    </div>
-  </div>;
+  const sgMax=Math.max(...[p.sg_dist,p.sg_acc,p.sg_app,p.sg_arg,p.sg_putt].map(v=>Math.abs(v||0)),0.05);
+  const bar=(v)=><div style={{display:"flex",alignItems:"center",gap:6}}><div style={{width:55,textAlign:"right",fontSize:10,color:"#94a3b8"}}>{v>0?"+":""}{(v||0).toFixed(3)}</div><div style={{flex:1,height:7,background:"#1e293b",borderRadius:4,overflow:"hidden"}}><div style={{width:Math.abs((v||0)/sgMax*100)+"%",height:"100%",background:v>=0?"#22c55e":"#ef4444",borderRadius:4}}/></div></div>;
+  return<div style={{padding:"14px 18px",background:"#090d14",display:"grid",gridTemplateColumns:"1fr 1fr",gap:18}}>
+    <div><div style={{fontSize:12,fontWeight:700,color:"#22d3ee",marginBottom:8}}>{p.name} — SG Profile</div>
+      {[["Drv Distance",p.sg_dist],["Drv Accuracy",p.sg_acc],["Approach",p.sg_app],["Around Green",p.sg_arg],["Putting",p.sg_putt]].map(([l,v])=>(<div key={l} style={{marginBottom:6}}><div style={{fontSize:9,color:"#64748b",marginBottom:2,textTransform:"uppercase"}}>{l}</div>{bar(v||0)}</div>))}
+      <div style={{marginTop:10,fontSize:10,color:"#64748b"}}>Base: <b style={{color:"#e2e8f0"}}>{p.baseline?.toFixed(4)||"—"}</b> · CH: <b style={{color:"#e2e8f0"}}>{(p.course_history_adj||0).toFixed(4)}</b> · Fit: <b style={{color:"#e2e8f0"}}>{(p.course_fit_adj||0).toFixed(4)}</b> · Form: <b style={{color:"#e2e8f0"}}>{(p.recent_form_adj||0).toFixed(4)}</b> · SimC: <b style={{color:"#a78bfa"}}>{(p.similar_course_adj||0).toFixed(4)}</b></div></div>
+    <div><div style={{fontSize:12,fontWeight:700,color:"#22d3ee",marginBottom:8}}>Probabilities & DK Odds</div>
+      {MARKETS.map(m=>{const sp=p[smk[m]]||0,od=p.playerOdds?.[m],ciVal=ci95(sp,n);const imp=od?.bestOdds>1?decToImp(od.bestOdds):null;const ev=imp!=null?sp-imp:null;const kb=ev!=null&&ev>0&&od?.bestOdds>1?kellyBet(sp,od.bestOdds,kellyFrac,bankroll):0;
+        return<div key={m} style={{marginBottom:7,padding:"6px 9px",background:"#0f172a",borderRadius:4}}><div style={{display:"flex",justifyContent:"space-between"}}><span style={{fontSize:10,fontWeight:600,color:"#cbd5e1"}}>{MARKET_LABELS[m]}</span><span style={{fontSize:11,fontWeight:700,color:"#22d3ee"}}>{pFmt(sp)}</span></div><div style={{fontSize:9,color:"#64748b",marginTop:1}}>CI: [{pFmt(Math.max(0,sp-ciVal))}, {pFmt(Math.min(1,sp+ciVal))}]</div>{od&&<div style={{fontSize:9,marginTop:3,display:"flex",justifyContent:"space-between",gap:4}}><span style={{color:"#475569"}}>DK {od.bestOdds.toFixed(2)} (imp {pFmt(imp)})</span><span style={{fontWeight:700,color:ev>0.01?"#22c55e":ev<-0.02?"#ef4444":"#64748b"}}>{evFmt(ev)}{kb>0?" · $"+kb.toFixed(2):""}</span></div>}</div>;})}
+    </div></div>;
 }
 
-function PasteBox({onImport}){
-  const [t,setT]=useState("");const [st,setSt]=useState(null);const [log,setLog]=useState([]);
-  const go=()=>{if(!t.trim())return;const r=onImport(t);setSt(r);if(r.ok){setLog(l=>[...l,r.msg]);setT("");}};
-  return(<div>
-    <label style={{fontSize:11,fontWeight:600,color:"#94a3b8",textTransform:"uppercase",letterSpacing:"0.05em"}}>Paste JSON Data</label>
-    <div style={{fontSize:10,color:"#64748b",marginBottom:4}}>Open endpoint → Ctrl+A → Ctrl+C → Paste here. Auto-detects: decompositions, predictions, skills, odds, matchups.</div>
-    <div style={{position:"relative"}}><textarea value={t} onChange={e=>setT(e.target.value)} rows={4} placeholder="Paste DataGolf JSON here..." style={{width:"100%",padding:"9px 11px",fontSize:11,fontFamily:"'JetBrains Mono',monospace",background:"#1e293b",color:"#e2e8f0",border:"1px solid #334155",borderRadius:5,outline:"none",resize:"vertical",boxSizing:"border-box"}}/>
-    {t.trim()&&<button onClick={go} style={{position:"absolute",bottom:8,right:8,padding:"4px 10px",fontSize:10,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:3,cursor:"pointer"}}>Import</button>}</div>
+/* ── PasteBox ── */
+function PasteBox({onImport}){const [t,setT]=useState("");const [st,setSt]=useState(null);const [log,setLog]=useState([]);const go=()=>{if(!t.trim())return;const r=onImport(t);setSt(r);if(r.ok){setLog(l=>[...l,r.msg]);setT("");}};
+  return(<div><label style={{fontSize:11,fontWeight:600,color:"#94a3b8",textTransform:"uppercase",letterSpacing:"0.05em"}}>Paste JSON Data</label><div style={{fontSize:10,color:"#64748b",marginBottom:4}}>Auto-detects: decompositions, predictions, skills, odds, matchups.</div>
+    <div style={{position:"relative"}}><textarea value={t} onChange={e=>setT(e.target.value)} rows={4} placeholder="Paste DataGolf JSON..." style={{width:"100%",padding:"9px 11px",fontSize:11,fontFamily:"'JetBrains Mono',monospace",background:"#1e293b",color:"#e2e8f0",border:"1px solid #334155",borderRadius:5,outline:"none",resize:"vertical",boxSizing:"border-box"}}/>{t.trim()&&<button onClick={go} style={{position:"absolute",bottom:8,right:8,padding:"4px 10px",fontSize:10,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:3,cursor:"pointer"}}>Import</button>}</div>
     {st&&<div style={{fontSize:11,marginTop:3,padding:"4px 7px",borderRadius:3,background:st.ok?"#0a2e1a":"#1c1117",color:st.ok?"#4ade80":"#fca5a5",border:"1px solid "+(st.ok?"#166534":"#7f1d1d")}}>{st.msg}</div>}
     {log.length>0&&<div style={{marginTop:6,display:"flex",flexWrap:"wrap",gap:3}}>{log.map((l,i)=>(<span key={i} style={{fontSize:9,padding:"2px 5px",borderRadius:3,background:"#164e63",color:"#67e8f9"}}>{l}</span>))}</div>}
   </div>);
 }
 
-const S={
-  root:{fontFamily:"'JetBrains Mono','SF Mono',monospace",background:"#0a0e17",color:"#e2e8f0",minHeight:"100vh"},
-  header:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px 18px",borderBottom:"1px solid #1e293b",background:"linear-gradient(180deg,#0f172a,#0a0e17)"},
-  hL:{display:"flex",alignItems:"center",gap:10},logo:{fontSize:24,color:"#22d3ee",filter:"drop-shadow(0 0 6px rgba(34,211,238,0.4))"},
-  title:{fontSize:16,fontWeight:700,margin:0,color:"#f1f5f9"},sub:{fontSize:10,color:"#64748b",marginTop:1},
-  badges:{display:"flex",gap:5},badge:{fontSize:9,padding:"2px 7px",borderRadius:3,background:"#1e293b",color:"#94a3b8",border:"1px solid #334155"},
-  tabs:{display:"flex",gap:2,padding:"5px 18px",background:"#0f172a",borderBottom:"1px solid #1e293b",overflowX:"auto"},
-  tab:{padding:"6px 12px",fontSize:10,fontWeight:500,fontFamily:"inherit",background:"transparent",color:"#64748b",border:"none",borderRadius:4,cursor:"pointer",whiteSpace:"nowrap"},
-  tabOn:{background:"#1e293b",color:"#22d3ee"},tabOff:{opacity:0.3,cursor:"not-allowed"},
-  panel:{padding:"18px",maxWidth:1200,margin:"0 auto"},
-  h2:{fontSize:14,fontWeight:700,margin:"0 0 5px",color:"#f1f5f9"},h3:{fontSize:11,fontWeight:600,margin:"0 0 6px",color:"#cbd5e1"},
-  help:{fontSize:11,color:"#64748b",margin:"0 0 12px",lineHeight:1.5},
-  label:{display:"block",fontSize:10,fontWeight:600,color:"#94a3b8",marginBottom:4,textTransform:"uppercase",letterSpacing:"0.05em"},
-  row:{display:"flex",gap:6},inp:{flex:1,padding:"8px 10px",fontSize:12,fontFamily:"inherit",background:"#1e293b",color:"#e2e8f0",border:"1px solid #334155",borderRadius:4,outline:"none"},
-  ok:{fontSize:10,color:"#22c55e",marginTop:4},
-  err:{margin:"8px 18px",padding:"8px 12px",background:"#1c1117",border:"1px solid #7f1d1d",borderRadius:4,fontSize:11,color:"#fca5a5"},
-  warn:{marginBottom:12,padding:"10px 14px",background:"#1a1a0e",border:"1px solid #854d0e",borderRadius:5,fontSize:11,color:"#fbbf24",lineHeight:1.5},
-  dv:{height:1,background:"#1e293b"},
-  btnP:{padding:"8px 16px",fontSize:11,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:4,cursor:"pointer",whiteSpace:"nowrap"},
-  btnSm:{padding:"4px 8px",fontSize:10,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:3,cursor:"pointer",whiteSpace:"nowrap"},
-  btnBig:{width:"100%",padding:"12px 18px",fontSize:12,fontWeight:700,fontFamily:"inherit",background:"linear-gradient(135deg,#0891b2,#22d3ee)",color:"#0a0e17",border:"none",borderRadius:6,cursor:"pointer"},
-  btnRun:{width:"100%",padding:"14px 18px",fontSize:14,fontWeight:700,fontFamily:"inherit",background:"linear-gradient(135deg,#059669,#22c55e)",color:"#0a0e17",border:"none",borderRadius:6,cursor:"pointer"},
-  stRow:{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 12px",background:"#0f172a",borderRadius:5},
-  loadBar:{marginTop:12,padding:"8px 12px",background:"#0a2e1a",border:"1px solid #166534",borderRadius:5,display:"flex",alignItems:"center",justifyContent:"space-between",fontSize:12,color:"#4ade80",fontWeight:600},
-  side:{background:"#0f172a",border:"1px solid #1e293b",borderRadius:6,padding:12},
-  slG:{marginBottom:16},slH:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:1},
-  slL:{fontSize:12,fontWeight:600,color:"#e2e8f0"},slV:{fontSize:13,fontWeight:700,color:"#22d3ee",fontVariantNumeric:"tabular-nums",minWidth:36,textAlign:"right"},
-  slider:{width:"100%"},
-  preBtn:{flex:1,padding:"4px 7px",fontSize:10,fontFamily:"inherit",background:"#1e293b",color:"#94a3b8",border:"1px solid #334155",borderRadius:3,cursor:"pointer",textAlign:"left"},
-  preDel:{padding:"2px 5px",fontSize:10,fontFamily:"inherit",background:"transparent",color:"#64748b",border:"none",cursor:"pointer"},
-  qpBtn:{display:"block",width:"100%",padding:"6px 7px",fontSize:10,fontFamily:"inherit",background:"#1e293b",color:"#cbd5e1",border:"1px solid #334155",borderRadius:3,cursor:"pointer",textAlign:"left",marginBottom:2},
-  empty:{fontSize:10,color:"#475569",fontStyle:"italic",padding:"4px 0"},
-  simBtn:{padding:"6px 12px",fontSize:11,fontWeight:500,fontFamily:"inherit",background:"#1e293b",color:"#94a3b8",border:"1px solid #334155",borderRadius:4,cursor:"pointer"},
-  simBtnOn:{background:"#164e63",color:"#22d3ee",borderColor:"#22d3ee"},
-  cfgBox:{background:"#0f172a",border:"1px solid #1e293b",borderRadius:6,padding:12},
-  tW:{overflowX:"auto",border:"1px solid #1e293b",borderRadius:6},
-  table:{width:"100%",borderCollapse:"collapse",fontSize:10,fontVariantNumeric:"tabular-nums"},
-  th:{padding:"7px 9px",textAlign:"right",fontSize:8,fontWeight:700,color:"#64748b",textTransform:"uppercase",letterSpacing:"0.05em",borderBottom:"2px solid #1e293b",background:"#0f172a",position:"sticky",top:0,whiteSpace:"nowrap",userSelect:"none"},
-  trE:{background:"#0a0e17"},trO:{background:"#0d1220"},
-  td:{padding:"6px 9px",textAlign:"right",color:"#cbd5e1",borderBottom:"1px solid #111827",whiteSpace:"nowrap"},
-  tdR:{padding:"6px 9px",textAlign:"center",color:"#475569",borderBottom:"1px solid #111827",fontSize:9,width:28},
-  tdN:{padding:"6px 9px",textAlign:"left",color:"#f1f5f9",fontWeight:600,borderBottom:"1px solid #111827",whiteSpace:"nowrap"},
-  tdH:{padding:"6px 9px",textAlign:"right",color:"#22d3ee",fontWeight:700,borderBottom:"1px solid #111827"},
-  tdD:{padding:"6px 9px",textAlign:"right",color:"#475569",borderBottom:"1px solid #111827"},
-  hCard:{padding:"10px 12px",background:"#0f172a",border:"1px solid #1e293b",borderRadius:6,marginBottom:6},
-  hP:{fontSize:10,color:"#94a3b8",padding:"1px 5px",background:"#1e293b",borderRadius:3},
-};
+const S={root:{fontFamily:"'JetBrains Mono','SF Mono',monospace",background:"#0a0e17",color:"#e2e8f0",minHeight:"100vh"},header:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px 18px",borderBottom:"1px solid #1e293b",background:"linear-gradient(180deg,#0f172a,#0a0e17)"},hL:{display:"flex",alignItems:"center",gap:10},logo:{fontSize:24,color:"#22d3ee",filter:"drop-shadow(0 0 6px rgba(34,211,238,0.4))"},title:{fontSize:16,fontWeight:700,margin:0,color:"#f1f5f9"},sub:{fontSize:10,color:"#64748b",marginTop:1},badges:{display:"flex",gap:5,flexWrap:"wrap"},badge:{fontSize:9,padding:"2px 7px",borderRadius:3,background:"#1e293b",color:"#94a3b8",border:"1px solid #334155"},tabs:{display:"flex",gap:2,padding:"5px 18px",background:"#0f172a",borderBottom:"1px solid #1e293b",overflowX:"auto"},tab:{padding:"6px 12px",fontSize:10,fontWeight:500,fontFamily:"inherit",background:"transparent",color:"#64748b",border:"none",borderRadius:4,cursor:"pointer",whiteSpace:"nowrap"},tabOn:{background:"#1e293b",color:"#22d3ee"},tabOff:{opacity:0.3,cursor:"not-allowed"},panel:{padding:"18px",maxWidth:1200,margin:"0 auto"},section:{marginBottom:24},h2:{fontSize:14,fontWeight:700,margin:"0 0 5px",color:"#f1f5f9"},h3:{fontSize:11,fontWeight:600,margin:"0 0 6px",color:"#cbd5e1"},help:{fontSize:11,color:"#64748b",margin:"0 0 12px",lineHeight:1.5},label:{display:"block",fontSize:10,fontWeight:600,color:"#94a3b8",marginBottom:4,textTransform:"uppercase",letterSpacing:"0.05em"},row:{display:"flex",gap:6},inp:{flex:1,padding:"8px 10px",fontSize:12,fontFamily:"inherit",background:"#1e293b",color:"#e2e8f0",border:"1px solid #334155",borderRadius:4,outline:"none"},ok:{fontSize:10,color:"#22c55e",marginTop:4},err:{margin:"8px 18px",padding:"8px 12px",background:"#1c1117",border:"1px solid #7f1d1d",borderRadius:4,fontSize:11,color:"#fca5a5"},warn:{marginBottom:12,padding:"10px 14px",background:"#1a1a0e",border:"1px solid #854d0e",borderRadius:5,fontSize:11,color:"#fbbf24",lineHeight:1.5},dv:{height:1,background:"#1e293b"},btnP:{padding:"8px 16px",fontSize:11,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:4,cursor:"pointer",whiteSpace:"nowrap"},btnSm:{padding:"4px 8px",fontSize:10,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:3,cursor:"pointer",whiteSpace:"nowrap"},btnBig:{width:"100%",padding:"12px 18px",fontSize:12,fontWeight:700,fontFamily:"inherit",background:"linear-gradient(135deg,#0891b2,#22d3ee)",color:"#0a0e17",border:"none",borderRadius:6,cursor:"pointer"},btnRun:{width:"100%",padding:"14px 18px",fontSize:14,fontWeight:700,fontFamily:"inherit",background:"linear-gradient(135deg,#059669,#22c55e)",color:"#0a0e17",border:"none",borderRadius:6,cursor:"pointer"},stRow:{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 12px",background:"#0f172a",borderRadius:5},loadBar:{marginTop:12,padding:"8px 12px",background:"#0a2e1a",border:"1px solid #166534",borderRadius:5,display:"flex",alignItems:"center",justifyContent:"space-between",fontSize:12,color:"#4ade80",fontWeight:600},side:{background:"#0f172a",border:"1px solid #1e293b",borderRadius:6,padding:12},slG:{marginBottom:16},slH:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:1},slL:{fontSize:12,fontWeight:600,color:"#e2e8f0"},slV:{fontSize:13,fontWeight:700,color:"#22d3ee",fontVariantNumeric:"tabular-nums",minWidth:36,textAlign:"right"},slider:{width:"100%"},preBtn:{flex:1,padding:"4px 7px",fontSize:10,fontFamily:"inherit",background:"#1e293b",color:"#94a3b8",border:"1px solid #334155",borderRadius:3,cursor:"pointer",textAlign:"left"},preDel:{padding:"2px 5px",fontSize:10,fontFamily:"inherit",background:"transparent",color:"#64748b",border:"none",cursor:"pointer"},qpBtn:{display:"block",width:"100%",padding:"6px 7px",fontSize:10,fontFamily:"inherit",background:"#1e293b",color:"#cbd5e1",border:"1px solid #334155",borderRadius:3,cursor:"pointer",textAlign:"left",marginBottom:2},empty:{fontSize:10,color:"#475569",fontStyle:"italic",padding:"4px 0"},simBtn:{padding:"6px 12px",fontSize:11,fontWeight:500,fontFamily:"inherit",background:"#1e293b",color:"#94a3b8",border:"1px solid #334155",borderRadius:4,cursor:"pointer"},simBtnOn:{background:"#164e63",color:"#22d3ee",borderColor:"#22d3ee"},cfgBox:{background:"#0f172a",border:"1px solid #1e293b",borderRadius:6,padding:12},tW:{overflowX:"auto",border:"1px solid #1e293b",borderRadius:6},table:{width:"100%",borderCollapse:"collapse",fontSize:10,fontVariantNumeric:"tabular-nums"},th:{padding:"7px 9px",textAlign:"right",fontSize:8,fontWeight:700,color:"#64748b",textTransform:"uppercase",letterSpacing:"0.05em",borderBottom:"2px solid #1e293b",background:"#0f172a",position:"sticky",top:0,whiteSpace:"nowrap",userSelect:"none"},trE:{background:"#0a0e17"},trO:{background:"#0d1220"},td:{padding:"6px 9px",textAlign:"right",color:"#cbd5e1",borderBottom:"1px solid #111827",whiteSpace:"nowrap"},tdR:{padding:"6px 9px",textAlign:"center",color:"#475569",borderBottom:"1px solid #111827",fontSize:9,width:28},tdN:{padding:"6px 9px",textAlign:"left",color:"#f1f5f9",fontWeight:600,borderBottom:"1px solid #111827",whiteSpace:"nowrap"},tdH:{padding:"6px 9px",textAlign:"right",color:"#22d3ee",fontWeight:700,borderBottom:"1px solid #111827"},tdD:{padding:"6px 9px",textAlign:"right",color:"#475569",borderBottom:"1px solid #111827"},hCard:{padding:"10px 12px",background:"#0f172a",border:"1px solid #1e293b",borderRadius:6,marginBottom:6},hP:{fontSize:10,color:"#94a3b8",padding:"1px 5px",background:"#1e293b",borderRadius:3}};
 ReactDOM.render(<App/>,document.getElementById("root"));
 </script>
 </body>
