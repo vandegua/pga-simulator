@@ -87,9 +87,9 @@ const spearmanCorr=(x,y)=>pearsonCorr(rankArray(x),rankArray(y));
 const dgFetch=async(path,params,pi)=>{
   const url=new URL(DG_BASE+path);Object.entries(params).forEach(([k,v])=>url.searchParams.set(k,v));url.searchParams.set("file_format","json");
   const raw=url.toString(),proxied=PROXIES[pi]?.fn(raw)||raw;
-  const ctrl=new AbortController();const t=setTimeout(()=>ctrl.abort(),15000);
-  try{const r=await fetch(proxied,{signal:ctrl.signal,headers:{Accept:"application/json"}});clearTimeout(t);if(!r.ok)throw new Error(r.status);const d=await r.json();return d?.contents?JSON.parse(d.contents):d;}
-  catch(e){clearTimeout(t);throw e;}
+  const timeout=new Promise((_,rej)=>setTimeout(()=>rej(new Error("timeout")),15000));
+  const req=fetch(proxied,{headers:{Accept:"application/json"}}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json();}).then(d=>d?.contents?JSON.parse(d.contents):d);
+  return Promise.race([req,timeout]);
 };
 const findArr=d=>{if(Array.isArray(d))return d;if(typeof d!=="object"||!d)return null;for(const k of Object.keys(d)){if(Array.isArray(d[k])&&d[k].length>0&&typeof d[k][0]==="object")return d[k];}const v=Object.values(d);if(v.length>5&&v.every(x=>typeof x==="object"&&x&&!Array.isArray(x)))return v;return null;};
 
@@ -235,12 +235,24 @@ function App(){
   },[players,sgW,ctxW,simCount,tourney,hist,ds.matchupPairs]);
 
   /* ── Event list for dropdowns ── */
+  const [eventListError,setEventListError]=useState("");
+  const [eventPasteOpen,setEventPasteOpen]=useState(false);const [eventPasteText,setEventPasteText]=useState("");
   const fetchEventList=async()=>{
-    setEventListLoading(true);const apiK=apiKey||DG_KEY_HIST;
-    try{const d=await dgFetch("/historical-event-data/events",{key:apiK,tour:"pga"},0);const arr=findArr(d);
-      if(arr?.length){const sorted=arr.sort((a,b)=>(b.calendar_year||0)-(a.calendar_year||0)||(b.event_id||"").localeCompare(a.event_id||""));setEventList(sorted);sSet("eventList",sorted);}
-    }catch(e){console.log("Event list fetch failed:",e);}setEventListLoading(false);
+    setEventListLoading(true);setEventListError("");const apiK=apiKey||DG_KEY_HIST;
+    for(let pi=0;pi<PROXIES.length;pi++){
+      try{
+        const d=await dgFetch("/historical-event-data/events",{key:apiK,tour:"pga"},pi);const arr=findArr(d);
+        if(arr?.length){const sorted=arr.sort((a,b)=>(b.calendar_year||0)-(a.calendar_year||0));setEventList(sorted);sSet("eventList",sorted);setEventListLoading(false);return;}
+      }catch(e){console.log("Proxy "+PROXIES[pi].name+" failed:",e);}
+    }
+    setEventListError("Proxies failed — use Open ↗ then paste below.");setEventPasteOpen(true);setEventListLoading(false);
   };
+  const importEventList=(text)=>{
+    try{const raw=JSON.parse(text.trim());const arr=findArr(raw);
+      if(arr?.length){const sorted=arr.sort((a,b)=>(b.calendar_year||0)-(a.calendar_year||0));setEventList(sorted);sSet("eventList",sorted);setEventPasteOpen(false);setEventPasteText("");setEventListError("");return true;}
+    }catch{}return false;
+  };
+  const eventListUrl=DG_BASE+"/historical-event-data/events?tour=pga&file_format=json&key="+(apiKey||DG_KEY_HIST);
   useEffect(()=>{const cached=sGet("eventList");if(cached)setEventList(cached);},[]);
 
   const handleCourseEventSelect=(val)=>{
@@ -340,7 +352,24 @@ function App(){
       <div style={{display:"flex",flexDirection:"column",gap:5}}>
         {[{key:"decomp",label:"Player Decompositions",req:true,on:dSt.decomp,desc:"baseline_pred, driving adjustments, approach, short game, putting, course history, fit, form",path:"/preds/player-decompositions?tour=pga"},{key:"preds",label:"Pre-Tournament Predictions",on:dSt.preds,desc:"DG model win/top5/top10/top20/make_cut",path:"/preds/pre-tournament?tour=pga&odds_format=percent"},{key:"skills",label:"Skill Ratings",on:dSt.skills,desc:"Overall SG ratings per category",path:"/preds/skill-ratings?display=value"},{key:"odds_win",label:"Odds — Win",on:dSt.odds.includes("win"),desc:"DraftKings outright win odds",path:"/betting-tools/outrights?tour=pga&market=win&odds_format=decimal"},{key:"odds_t5",label:"Odds — Top 5",on:dSt.odds.includes("top_5"),desc:"DraftKings Top 5",path:"/betting-tools/outrights?tour=pga&market=top_5&odds_format=decimal"},{key:"odds_t10",label:"Odds — Top 10",on:dSt.odds.includes("top_10"),desc:"DraftKings Top 10",path:"/betting-tools/outrights?tour=pga&market=top_10&odds_format=decimal"},{key:"odds_t20",label:"Odds — Top 20",on:dSt.odds.includes("top_20"),desc:"DraftKings Top 20",path:"/betting-tools/outrights?tour=pga&market=top_20&odds_format=decimal"},{key:"matchups",label:"Matchups ("+dSt.matchups+")",on:dSt.matchups>0,desc:"72-hole H2H pairs",path:"/betting-tools/matchups?tour=pga&market=tournament_matchups&odds_format=decimal"}].map(d=>(<div key={d.key} style={{...S.stRow,borderLeft:"3px solid "+(d.on?"#22c55e":d.req?"#f59e0b":"#334155")}}><div style={{flex:1}}><span style={{color:d.on?"#22c55e":"#64748b",fontWeight:600,fontSize:12}}>{d.on?"✓":"○"} {d.label}{d.req&&!d.on&&<span style={{color:"#f59e0b",fontSize:9,marginLeft:5}}>REQUIRED</span>}</span><div style={{fontSize:10,color:"#475569",marginTop:1}}>{d.desc}</div></div>{apiKey&&!d.on&&<button onClick={()=>window.open(DG_BASE+d.path+"&file_format=json&key="+apiKey,"_blank")} style={S.btnSm}>Open ↗</button>}</div>))}
       </div>
-      <div style={{marginTop:14}}><PasteBox onImport={handleImport}/></div>
+      {/* Event List for Course/Grading dropdowns */}
+      <div style={{marginTop:8,...S.stRow,borderLeft:"3px solid "+(eventList?"#22c55e":"#334155")}}>
+        <div style={{flex:1}}><span style={{color:eventList?"#22c55e":"#64748b",fontWeight:600,fontSize:12}}>{eventList?"✓":"○"} Historical Event List{eventList?" ("+eventList.length+")":""}</span><div style={{fontSize:10,color:"#475569",marginTop:1}}>Tournament names & IDs for Course and Grading tab dropdowns — load once, cached permanently</div></div>
+        <div style={{display:"flex",gap:4}}>
+          {!eventList&&<button onClick={fetchEventList} disabled={eventListLoading} style={S.btnSm}>{eventListLoading?"⏳ Trying...":"Load"}</button>}
+          {!eventList&&<button onClick={()=>window.open(eventListUrl,"_blank")} style={S.btnSm}>Open ↗</button>}
+        </div>
+      </div>
+      {!eventList&&eventListError&&<div style={{fontSize:10,color:"#fca5a5",marginTop:4}}>{eventListError}</div>}
+      <div style={{marginTop:14}}><PasteBox onImport={(text)=>{
+        try{const raw=JSON.parse(text.trim());const arr=findArr(raw);
+          if(arr?.length&&arr[0].event_id!==undefined&&arr[0].calendar_year!==undefined){
+            const sorted=arr.sort((a,b)=>(b.calendar_year||0)-(a.calendar_year||0));setEventList(sorted);sSet("eventList",sorted);setEventListError("");
+            return{ok:true,msg:"✓ Event List ("+sorted.length+" events)"};
+          }
+        }catch{}
+        return handleImport(text);
+      }}/></div>
       {players.length>0&&<div style={S.loadBar}><span>✓ {players.length} players loaded</span><button onClick={()=>setTab("course")} style={S.btnP}>Course →</button></div>}
     </div>}
 
@@ -362,13 +391,13 @@ function App(){
         </tbody></table></div></div>}
 
       {courseCSV&&<div style={S.section}><h3 style={S.h3}>📈 Historical Course Profile</h3><p style={{fontSize:10,color:"#64748b",marginBottom:8}}>Fetch historical rounds to see which SG categories correlate with good finishes.</p>
-        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:10}}>
-          {!eventList&&<button onClick={fetchEventList} disabled={eventListLoading} style={{...S.btnSm,background:"#1e293b",color:"#94a3b8",border:"1px solid #334155"}}>{eventListLoading?"Loading events...":"Load Event List"}</button>}
+        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}>
+          {!eventList&&<span style={{fontSize:11,color:"#f59e0b"}}>⚠ Load Historical Event List on the Setup tab first</span>}
           {eventList&&<select value={courseHistEventId?courseHistEventId+"|"+courseHistYear:""} onChange={e=>handleCourseEventSelect(e.target.value)} style={{...S.inp,maxWidth:400}}>
             <option value="">Select tournament...</option>
             {eventList.map((ev,i)=><option key={i} value={(ev.event_id||"")+"|"+(ev.calendar_year||"")}>{ev.event_name||ev.event_id} — {ev.calendar_year}{ev.course?" · "+ev.course:""}</option>)}
           </select>}
-          <button onClick={fetchCourseHist} disabled={courseHistLoading||!courseHistEventId} style={{...S.btnP,opacity:courseHistLoading||!courseHistEventId?0.5:1}}>{courseHistLoading?"⏳ Loading...":"Fetch Historical Data"}</button>
+          {eventList&&<button onClick={fetchCourseHist} disabled={courseHistLoading||!courseHistEventId} style={{...S.btnP,opacity:courseHistLoading||!courseHistEventId?0.5:1}}>{courseHistLoading?"⏳ Loading...":"Fetch Historical Data"}</button>}
         </div>
         {courseHistStatus&&<div style={{fontSize:11,color:courseHistStatus.startsWith("✓")?"#22c55e":"#94a3b8",marginBottom:10}}>{courseHistStatus}</div>}
         {(courseCorr||simCourseCorr)&&<div style={{display:"grid",gridTemplateColumns:courseCorr&&simCourseCorr?"1fr 1fr":"1fr",gap:18}}>
@@ -445,13 +474,14 @@ function App(){
     {tab==="grading"&&<div style={S.panel}><h2 style={S.h2}>Post-Tournament Grading</h2><p style={S.help}>Compare projections against actual results and see what SG categories mattered.</p>
       <div style={S.section}><h3 style={S.h3}>Select Simulation</h3><select value={gradingSim?.id||""} onChange={e=>{const h=hist.find(x=>x.id===+e.target.value);setGradingSim(h||null);}} style={{...S.inp,maxWidth:500,marginBottom:10}}><option value="">Choose...</option>{hist.map(h=><option key={h.id} value={h.id}>{h.t} — {new Date(h.date).toLocaleDateString()} — {h.n?.toLocaleString()} sims</option>)}</select>
         {gradingSim&&<div style={{padding:8,background:"#0f172a",borderRadius:5,fontSize:10,color:"#94a3b8",marginBottom:10}}><b style={{color:"#22d3ee"}}>{gradingSim.t}</b> · {gradingSim.n?.toLocaleString()} sims · D:{gradingSim.sg?.dist}% Ac:{gradingSim.sg?.acc}% Ap:{gradingSim.sg?.app}% AR:{gradingSim.sg?.arg}% P:{gradingSim.sg?.putt}%</div>}</div>
-      <div style={S.section}><h3 style={S.h3}>Fetch Actual Results</h3><div style={{display:"flex",gap:6,alignItems:"center",marginBottom:10,flexWrap:"wrap"}}>
-          {!eventList&&<button onClick={fetchEventList} disabled={eventListLoading} style={{...S.btnSm,background:"#1e293b",color:"#94a3b8",border:"1px solid #334155"}}>{eventListLoading?"Loading events...":"Load Event List"}</button>}
+      <div style={S.section}><h3 style={S.h3}>Fetch Actual Results</h3><div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}>
+          {!eventList&&<span style={{fontSize:11,color:"#f59e0b"}}>⚠ Load Historical Event List on the Setup tab first</span>}
           {eventList&&<select value={gradeEventId?gradeEventId+"|"+gradeYear:""} onChange={e=>handleGradeEventSelect(e.target.value)} style={{...S.inp,maxWidth:400}}>
             <option value="">Select completed tournament...</option>
             {eventList.map((ev,i)=><option key={i} value={(ev.event_id||"")+"|"+(ev.calendar_year||"")}>{ev.event_name||ev.event_id} — {ev.calendar_year}{ev.course?" · "+ev.course:""}</option>)}
           </select>}
-          <button onClick={fetchGradeResults} disabled={gradeLoading||!gradeEventId} style={{...S.btnP,opacity:gradeLoading||!gradeEventId?0.5:1}}>{gradeLoading?"⏳":"Fetch Results"}</button></div>{gradeStatus&&<div style={{fontSize:11,color:gradeStatus.startsWith("✓")?"#22c55e":"#94a3b8",marginBottom:10}}>{gradeStatus}</div>}</div>
+          {eventList&&<button onClick={fetchGradeResults} disabled={gradeLoading||!gradeEventId} style={{...S.btnP,opacity:gradeLoading||!gradeEventId?0.5:1}}>{gradeLoading?"⏳":"Fetch Results"}</button>}</div>
+        {gradeStatus&&<div style={{fontSize:11,color:gradeStatus.startsWith("✓")?"#22c55e":"#94a3b8",marginBottom:10}}>{gradeStatus}</div>}</div>
 
       {gradingSim&&gradeResults&&(()=>{const simMap={};gradingSim.top30?.forEach(p=>simMap[p.id||p.n]=p);const matched=gradeResults.filter(r=>simMap[r.pid]||simMap[r.name]).map(r=>{const sp=simMap[r.pid]||simMap[r.name];return{name:r.name,finish:r.finish,simWin:sp?.w||0,simT5:sp?.t5||0,simT10:sp?.t10||0,simT20:sp?.t20||0};}).sort((a,b)=>a.finish-b.finish);
         const corr=matched.length>=5?spearmanCorr(matched.map(m=>m.simWin),matched.map(m=>m.finish)):null;
