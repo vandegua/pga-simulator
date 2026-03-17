@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PGA Tournament Simulator v3</title>
+<title>PGA Tournament Simulator v4.6</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
@@ -21,7 +21,7 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const {useState,useEffect,useCallback,useMemo,useRef}=React;
+const {useState,useEffect,useCallback,useMemo}=React;
 const SENSITIVITY=4;
 const DG_BASE="https://feeds.datagolf.com";
 const WEATHER_KEY="f9747827ca9b4e7aa0b175947261303";
@@ -30,13 +30,23 @@ const SIM_COUNTS=[1000,5000,10000,25000,50000];
 const MARKETS=["win","top_5","top_10","top_20","make_cut"];
 const MARKET_LABELS={win:"Win",top_5:"Top 5",top_10:"Top 10",top_20:"Top 20",make_cut:"Make Cut"};
 const ROUND_STDEV=2.8;const KNOWN_BOOKS=["draftkings"];const MAX_STORE=15000;
+const OTT_DIST_RATIO=0.6;const OTT_ACC_RATIO=0.4;
+const MIN_BASKET_ROUNDS=8;
 const PROXIES=[
   {name:"corsproxy.io",fn:u=>"https://corsproxy.io/?"+encodeURIComponent(u)},
   {name:"allorigins",fn:u=>"https://api.allorigins.win/raw?url="+encodeURIComponent(u)},
   {name:"corsproxy.org",fn:u=>"https://corsproxy.org/?"+encodeURIComponent(u)},
   {name:"Direct",fn:u=>u},
 ];
-const COURSE_SIM_COLS=["putt_sg","arg_sg","app_sg","ott_sg","fw_diff","rgh_diff","non_rgh_diff","miss_fw_pen_frac","less_150_sg","greater_150_sg","arg_fairway_sg","arg_rough_sg","arg_bunker_sg","less_5_ft_sg","greater_5_less_15_sg","greater_15_sg"];
+const COURSE_SIM_COLS=[
+  {c:"putt_sg",w:4},{c:"arg_sg",w:4},{c:"app_sg",w:4},{c:"ott_sg",w:4},
+  {c:"fw_diff",w:2},{c:"rgh_diff",w:2},{c:"non_rgh_diff",w:1},{c:"miss_fw_pen_frac",w:2},
+  {c:"less_150_sg",w:1},{c:"greater_150_sg",w:1},
+  {c:"arg_fairway_sg",w:1},{c:"arg_rough_sg",w:1},{c:"arg_bunker_sg",w:1},
+  {c:"less_5_ft_sg",w:1},{c:"greater_5_less_15_sg",w:1},{c:"greater_15_sg",w:1}
+];
+const SG_CATS=[{k:"sg_ott",l:"Off the Tee",sk:"dist"},{k:"sg_app",l:"Approach",sk:"app"},{k:"sg_arg",l:"Around Green",sk:"arg"},{k:"sg_putt",l:"Putting",sk:"putt"}];
+const RADAR_SG_KEYS=[{k:"ott_sg",l:"Off the Tee"},{k:"app_sg",l:"Approach"},{k:"arg_sg",l:"Around Green"},{k:"putt_sg",l:"Putting"}];
 
 /* ── helpers ── */
 const normalRandom=()=>{let u=0,v=0;while(!u)u=Math.random();while(!v)v=Math.random();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);};
@@ -49,87 +59,133 @@ const kellyBet=(sp,dec,frac,br)=>{if(!dec||dec<=1||sp<=0)return 0;const b=dec-1,
 const downloadCSV=(rows,fname)=>{if(!rows.length)return;const hdrs=Object.keys(rows[0]);const csv=[hdrs.join(","),...rows.map(r=>hdrs.map(h=>{const v=r[h];return typeof v==="string"&&v.includes(",")?"\""+v+"\"":v??""}).join(","))].join("\n");const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download=fname;a.click();};
 const sGet=k=>{try{const v=localStorage.getItem("pga3_"+k);return v?JSON.parse(v):null;}catch{return null;}};
 const sSet=(k,v)=>{try{localStorage.setItem("pga3_"+k,JSON.stringify(v));}catch{}};
-
-/* ── CSV parser ── */
-const parseCSV=(text)=>{
-  const lines=text.split(/\r?\n/).filter(l=>l.trim());if(lines.length<2)return[];
-  const hdr=lines[0].split(",").map(h=>h.replace(/"/g,"").trim());
-  return lines.slice(1).map(line=>{
-    const vals=[];let cur="",inQ=false;
-    for(let i=0;i<line.length;i++){const c=line[i];if(c==='"'){inQ=!inQ;}else if(c===","&&!inQ){vals.push(cur);cur="";}else{cur+=c;}}
-    vals.push(cur);const obj={};hdr.forEach((h,i)=>{const v=vals[i]?.trim();obj[h]=isNaN(v)||v===""?v:parseFloat(v);});return obj;
-  });
-};
+const parseCSV=(text)=>{const lines=text.split(/\r?\n/).filter(l=>l.trim());if(lines.length<2)return[];const hdr=lines[0].split(",").map(h=>h.replace(/"/g,"").trim());return lines.slice(1).map(line=>{const vals=[];let cur="",inQ=false;for(let i=0;i<line.length;i++){const c=line[i];if(c==='"'){inQ=!inQ;}else if(c===","&&!inQ){vals.push(cur);cur="";}else{cur+=c;}}vals.push(cur);const obj={};hdr.forEach((h,i)=>{const v=vals[i]?.trim();obj[h]=isNaN(v)||v===""?v:parseFloat(v);});return obj;});};
 
 /* ── course similarity ── */
-const cosineSim=(a,b)=>{let dot=0,ma=0,mb=0;for(let i=0;i<a.length;i++){dot+=a[i]*b[i];ma+=a[i]*a[i];mb+=b[i]*b[i];}return(ma&&mb)?dot/(Math.sqrt(ma)*Math.sqrt(mb)):0;};
-const buildCourseVecs=(courses)=>{
-  const mins={},maxs={};COURSE_SIM_COLS.forEach(c=>{mins[c]=Infinity;maxs[c]=-Infinity;});
-  courses.forEach(cr=>{COURSE_SIM_COLS.forEach(c=>{const v=cr[c];if(typeof v==="number"&&!isNaN(v)){mins[c]=Math.min(mins[c],v);maxs[c]=Math.max(maxs[c],v);}});});
-  return courses.map(cr=>({course:cr.course,vec:COURSE_SIM_COLS.map(c=>{const v=cr[c],mn=mins[c],mx=maxs[c];return(typeof v==="number"&&mx>mn)?(v-mn)/(mx-mn):0;}),data:cr}));
-};
-const findSimilarCourses=(name,vecs,n=10)=>{
-  const target=vecs.find(v=>v.course?.toLowerCase()===name?.toLowerCase());if(!target)return[];
-  return vecs.filter(v=>v.course!==target.course).map(v=>({...v,sim:cosineSim(target.vec,v.vec)})).sort((a,b)=>b.sim-a.sim).slice(0,n);
-};
-const fuzzyMatch=(name,courses)=>{
-  if(!name||!courses.length)return null;const nl=name.toLowerCase().replace(/[^a-z0-9]/g,"");
-  let best=null,bestS=0;courses.forEach(c=>{const cl=(c.course||"").toLowerCase().replace(/[^a-z0-9]/g,"");let s=0;if(cl===nl)s=1;else if(cl.includes(nl)||nl.includes(cl))s=0.9;else{let m=0;for(let i=0;i<Math.min(cl.length,nl.length);i++)if(cl[i]===nl[i])m++;s=m/Math.max(cl.length,nl.length);}if(s>bestS){bestS=s;best=c;}});
-  return bestS>0.4?best:null;
-};
+const cosineSim=(a,b,weights)=>{let dot=0,ma=0,mb=0;for(let i=0;i<a.length;i++){const wt=weights?weights[i]:1;dot+=a[i]*b[i]*wt;ma+=a[i]*a[i]*wt;mb+=b[i]*b[i]*wt;}return(ma&&mb)?dot/(Math.sqrt(ma)*Math.sqrt(mb)):0;};
+const buildCourseVecs=(courses)=>{const cols=COURSE_SIM_COLS.map(x=>x.c);const weights=COURSE_SIM_COLS.map(x=>x.w);const mins={},maxs={};cols.forEach(c=>{mins[c]=Infinity;maxs[c]=-Infinity;});courses.forEach(cr=>{cols.forEach(c=>{const v=cr[c];if(typeof v==="number"&&!isNaN(v)){mins[c]=Math.min(mins[c],v);maxs[c]=Math.max(maxs[c],v);}});});return courses.map(cr=>({course:cr.course,vec:cols.map(c=>{const v=cr[c],mn=mins[c],mx=maxs[c];return(typeof v==="number"&&mx>mn)?(v-mn)/(mx-mn):0;}),weights,data:cr}));};
+const findSimilarCourses=(name,vecs,n=10)=>{const target=vecs.find(v=>v.course?.toLowerCase()===name?.toLowerCase());if(!target)return[];return vecs.filter(v=>v.course!==target.course).map(v=>({...v,sim:cosineSim(target.vec,v.vec,target.weights)})).sort((a,b)=>b.sim-a.sim).slice(0,n);};
+const fuzzyMatch=(name,courses)=>{if(!name||!courses.length)return null;const nl=name.toLowerCase().replace(/[^a-z0-9]/g,"");let best=null,bestS=0;courses.forEach(c=>{const cl=(c.course||"").toLowerCase().replace(/[^a-z0-9]/g,"");let s=0;if(cl===nl)s=1;else if(cl.includes(nl)||nl.includes(cl))s=0.9;else{let m=0;for(let i=0;i<Math.min(cl.length,nl.length);i++)if(cl[i]===nl[i])m++;s=m/Math.max(cl.length,nl.length);}if(s>bestS){bestS=s;best=c;}});return bestS>0.4?best:null;};
 
 /* ── correlation ── */
 const pearsonCorr=(x,y)=>{const n=x.length;if(n<3)return 0;const mx=x.reduce((a,b)=>a+b,0)/n,my=y.reduce((a,b)=>a+b,0)/n;let num=0,dx=0,dy=0;for(let i=0;i<n;i++){const a=x[i]-mx,b=y[i]-my;num+=a*b;dx+=a*a;dy+=b*b;}return(dx&&dy)?num/Math.sqrt(dx*dy):0;};
 const rankArray=(arr)=>{const idx=arr.map((v,i)=>({v,i})).sort((a,b)=>a.v-b.v);const ranks=new Array(arr.length);for(let i=0;i<idx.length;){let j=i;while(j<idx.length&&idx[j].v===idx[i].v)j++;const avg=(i+j+1)/2;for(let k=i;k<j;k++)ranks[idx[k].i]=avg;i=j;}return ranks;};
 const spearmanCorr=(x,y)=>pearsonCorr(rankArray(x),rankArray(y));
 
-/* ── DataGolf fetch ── */
-const dgFetch=async(path,params,pi)=>{
-  const url=new URL(DG_BASE+path);Object.entries(params).forEach(([k,v])=>url.searchParams.set(k,v));url.searchParams.set("file_format","json");
-  const raw=url.toString(),proxied=PROXIES[pi]?.fn(raw)||raw;
-  const timeout=new Promise((_,rej)=>setTimeout(()=>rej(new Error("timeout")),15000));
-  const req=fetch(proxied,{headers:{Accept:"application/json"}}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json();}).then(d=>d?.contents?JSON.parse(d.contents):d);
-  return Promise.race([req,timeout]);
+/* ── compute optimal weights from SG correlation ── */
+const computeOptimalWeights=(rounds)=>{
+  const byP={};rounds.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;const key=pid;if(!byP[key])byP[key]={pid,name:r.player_name||pid,rounds:0,finish:999,sg_ott:0,sg_app:0,sg_arg:0,sg_putt:0};const p=byP[key];p.rounds++;p.sg_ott+=(r.sg_ott||0);p.sg_app+=(r.sg_app||0);p.sg_arg+=(r.sg_arg||0);p.sg_putt+=(r.sg_putt||0);
+    /* Parse finish: handle "T15", "1", "CUT", "MC", "WD", numeric, or nested */
+    const ft=r.fin_text||r.finish_position||r.position||"";const digits=String(ft).match(/\d+/);const fn=digits?parseInt(digits[0]):999;p.finish=Math.min(p.finish,fn);});
+  const entries=Object.values(byP).filter(p=>p.rounds>=2&&p.finish<900);
+  if(entries.length<10)return null;
+  const finishes=entries.map(e=>e.finish);
+  const corrs=SG_CATS.map(c=>({...c,corr:spearmanCorr(entries.map(e=>e[c.k]),finishes)}));
+  const abs=corrs.map(c=>Math.abs(c.corr));const tot=abs.reduce((a,b)=>a+b,0)||1;
+  return{corrs:corrs.map((c,i)=>({...c,pct:Math.round(abs[i]/tot*100)})),n:entries.length};
 };
+
+/* ── Course characteristic radar data: scaled 0-1 per DG methodology ── */
+/* Each axis = how much this course's SG difficulty deviates from tour avg, */
+/* scaled so that the most extreme course in the CSV = 1.0 on that axis.   */
+/* This approximates DG's "correlation between golfer attribute and perf"  */
+/* since larger deviations = more skill differentiation = higher correlation */
+const buildCourseRadar=(course,allCourses)=>{
+  if(!course||!allCourses?.length)return null;
+  return RADAR_SG_KEYS.map(r=>{
+    const vals=allCourses.map(c=>c[r.k]).filter(v=>typeof v==="number"&&!isNaN(v));
+    if(!vals.length)return{l:r.l,scaled:0.5,raw:0,avg:0,minV:0,maxV:0};
+    const avg=vals.reduce((a,b)=>a+b,0)/vals.length;
+    /* Compute |deviation from avg| for all courses to find the max range */
+    const absDevs=vals.map(v=>Math.abs(v-avg));
+    const maxDev=Math.max(...absDevs,0.0001);
+    const raw=typeof course[r.k]==="number"?course[r.k]:avg;
+    const dev=Math.abs(raw-avg);
+    /* Scale: 0 = no deviation from avg, 1 = max deviation among all courses */
+    const scaled=dev/maxDev;
+    return{l:r.l,scaled,raw,avg,dev};
+  });
+};
+
+/* ── DataGolf fetch ── */
+const dgFetch=async(path,params,pi)=>{const url=new URL(DG_BASE+path);Object.entries(params).forEach(([k,v])=>url.searchParams.set(k,v));url.searchParams.set("file_format","json");const raw=url.toString(),proxied=PROXIES[pi]?.fn(raw)||raw;const timeout=new Promise((_,rej)=>setTimeout(()=>rej(new Error("timeout")),15000));const req=fetch(proxied,{headers:{Accept:"application/json"}}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json();}).then(d=>d?.contents?JSON.parse(d.contents):d);return Promise.race([req,timeout]);};
 const findArr=d=>{if(Array.isArray(d))return d;if(typeof d!=="object"||!d)return null;for(const k of Object.keys(d)){if(Array.isArray(d[k])&&d[k].length>0&&typeof d[k][0]==="object")return d[k];}const v=Object.values(d);if(v.length>5&&v.every(x=>typeof x==="object"&&x&&!Array.isArray(x)))return v;return null;};
 
 /* ── simulation engine ── */
-const runSim=(players,weights,n)=>{
-  if(!players.length)return{results:[],allScores:null};
-  const st=weights.sg_dist+weights.sg_acc+weights.sg_app+weights.sg_arg+weights.sg_putt;
-  const w=st>0?{dist:weights.sg_dist/st,acc:weights.sg_acc/st,app:weights.sg_app/st,arg:weights.sg_arg/st,putt:weights.sg_putt/st}:{dist:.2,acc:.2,app:.2,arg:.2,putt:.2};
-  const skills=players.map(p=>{
-    const userSG=p.sg_dist*w.dist+p.sg_acc*w.acc+p.sg_app*w.app+p.sg_arg*w.arg+p.sg_putt*w.putt;
-    const eqSG=(p.sg_dist+p.sg_acc+p.sg_app+p.sg_arg+p.sg_putt)*0.2;
-    const delta=(userSG-eqSG)*SENSITIVITY;
-    const base=(p.baseline||0)+delta;
-    return base+(p.course_history_adj||0)*weights.course_history+(p.course_fit_adj||0)*weights.course_fit+(p.recent_form_adj||0)*weights.recent_form+(p.similar_course_adj||0)*weights.similar_course;
-  });
-  const res=players.map(()=>({w:0,t5:0,t10:0,t20:0,mc:0,tp:0}));
-  const store=n<=MAX_STORE;const allScores=store?[]:null;
-  for(let s=0;s<n;s++){
-    const sc=skills.map(sk=>{let t=0;for(let r=0;r<4;r++)t+=-(sk+normalRandom()*ROUND_STDEV);return t;});
-    if(store)allScores.push(new Float32Array(sc));
-    const ix=sc.map((v,i)=>({v,i})).sort((a,b)=>a.v-b.v);let pos=1;
-    for(let j=0;j<ix.length;){let k=j;while(k<ix.length&&Math.abs(ix[k].v-ix[j].v)<.001)k++;const avg=(pos+pos+k-j-1)/2;for(let m=j;m<k;m++){const pi=ix[m].i;res[pi].tp+=avg;if(avg<=1)res[pi].w++;if(avg<=5)res[pi].t5++;if(avg<=10)res[pi].t10++;if(avg<=20)res[pi].t20++;if(avg<=65)res[pi].mc++;}pos+=k-j;j=k;}
-  }
-  return{results:players.map((p,i)=>({...p,sim_win:res[i].w/n,sim_top5:res[i].t5/n,sim_top10:res[i].t10/n,sim_top20:res[i].t20/n,sim_make_cut:res[i].mc/n,avg_finish:res[i].tp/n})),allScores};
-};
+const runSim=(players,weights,n)=>{if(!players.length)return{results:[],allScores:null};const st=weights.sg_dist+weights.sg_acc+weights.sg_app+weights.sg_arg+weights.sg_putt;const w=st>0?{dist:weights.sg_dist/st,acc:weights.sg_acc/st,app:weights.sg_app/st,arg:weights.sg_arg/st,putt:weights.sg_putt/st}:{dist:.2,acc:.2,app:.2,arg:.2,putt:.2};const skills=players.map(p=>{const userSG=p.sg_dist*w.dist+p.sg_acc*w.acc+p.sg_app*w.app+p.sg_arg*w.arg+p.sg_putt*w.putt;const eqSG=(p.sg_dist+p.sg_acc+p.sg_app+p.sg_arg+p.sg_putt)*0.2;const delta=(userSG-eqSG)*SENSITIVITY;const base=(p.baseline||0)+delta;return base+(p.course_history_adj||0)*weights.course_history+(p.course_fit_adj||0)*weights.course_fit+(p.recent_form_adj||0)*weights.recent_form+(p.similar_course_adj||0)*weights.similar_course;});const res=players.map(()=>({w:0,t5:0,t10:0,t20:0,mc:0,tp:0}));const store=n<=MAX_STORE;const allScores=store?[]:null;for(let s=0;s<n;s++){const sc=skills.map(sk=>{let t=0;for(let r=0;r<4;r++)t+=-(sk+normalRandom()*ROUND_STDEV);return t;});if(store)allScores.push(new Float32Array(sc));const ix=sc.map((v,i)=>({v,i})).sort((a,b)=>a.v-b.v);let pos=1;for(let j=0;j<ix.length;){let k=j;while(k<ix.length&&Math.abs(ix[k].v-ix[j].v)<.001)k++;const avg=(pos+pos+k-j-1)/2;for(let m=j;m<k;m++){const pi=ix[m].i;res[pi].tp+=avg;if(avg<=1)res[pi].w++;if(avg<=5)res[pi].t5++;if(avg<=10)res[pi].t10++;if(avg<=20)res[pi].t20++;if(avg<=65)res[pi].mc++;}pos+=k-j;j=k;}}return{results:players.map((p,i)=>({...p,sim_win:res[i].w/n,sim_top5:res[i].t5/n,sim_top10:res[i].t10/n,sim_top20:res[i].t20/n,sim_make_cut:res[i].mc/n,avg_finish:res[i].tp/n})),allScores};};
 const computeH2H=(allScores,players,pairs)=>{const idxMap={};players.forEach((p,i)=>idxMap[p.id]=i);const n=allScores.length,h2h={};for(const pair of pairs){const i=idxMap[pair.id1],j=idxMap[pair.id2];if(i==null||j==null)continue;let iW=0;for(let s=0;s<n;s++){if(allScores[s][i]<allScores[s][j])iW++;}h2h[pair.id1+"_"+pair.id2]=iW/n;h2h[pair.id2+"_"+pair.id1]=1-iW/n;}return h2h;};
 
-/* ── CorrBar component ── */
-function CorrBar({val,label,color}){
-  const pct=Math.abs(val)*100;
-  return <div style={{marginBottom:8}}>
-    <div style={{display:"flex",justifyContent:"space-between",fontSize:10,marginBottom:3}}><span style={{color:"#cbd5e1",fontWeight:600}}>{label}</span><span style={{color:val<-0.1?"#22c55e":val>0.1?"#ef4444":"#94a3b8",fontWeight:700}}>{val.toFixed(3)}</span></div>
-    <div style={{height:10,background:"#1e293b",borderRadius:5,overflow:"hidden"}}><div style={{width:Math.min(pct*2,100)+"%",height:"100%",background:color||(val<0?"#22c55e":"#ef4444"),borderRadius:5}}/></div>
-    <div style={{fontSize:8,color:"#475569",marginTop:1}}>{val<-0.2?"Strong predictor":val<-0.1?"Moderate predictor":val>0.1?"Inverse":"Weak"}</div>
+/* ══ Course SG Radar — DG-style with avg reference ══ */
+function CourseRadar({data,courseName,size=340}){
+  if(!data||!data.length)return null;
+  const pad=40,cx=size/2,cy=size/2,r=size/2-pad,n=data.length;
+  const angleStep=2*Math.PI/n;
+  const pt=(frac,i)=>{const a=i*angleStep-Math.PI/2;return[cx+r*frac*Math.cos(a),cy+r*frac*Math.sin(a)];};
+  const polyPts=(vals)=>vals.map((v,i)=>pt(v,i).join(",")).join(" ");
+  const gridLevels=[0.25,0.5,0.75,1];
+  /* Avg course would be at 0 deviation = center. We show a dashed reference at 0.5 for visual anchor */
+  const avgLevel=0.15;/* avg PGA tour course sits near center since its deviation is ~0 */
+  return <div style={{textAlign:"center"}}>
+    <div style={{fontSize:13,fontWeight:700,color:"#e2e8f0",marginBottom:2}}>{courseName||"Course"}</div>
+    <div style={{fontSize:9,color:"#64748b",marginBottom:8}}>RELATIVE IMPORTANCE</div>
+    <svg width={size} height={size+30} viewBox={`0 0 ${size} ${size+30}`}>
+      {/* Grid rings with scale labels */}
+      {gridLevels.map(g=><g key={g}><polygon points={polyPts(data.map(()=>g))} fill="none" stroke="#334155" strokeWidth={0.7}/>
+        <text x={cx+4} y={cy-r*g+3} fill="#475569" fontSize={7}>{g.toFixed(2)}</text></g>)}
+      {/* Axis lines + labels */}
+      {data.map((d,i)=>{const a=i*angleStep-Math.PI/2;const lx=cx+(r+22)*Math.cos(a),ly=cy+(r+22)*Math.sin(a);
+        return <g key={i}><line x1={cx} y1={cy} x2={cx+r*Math.cos(a)} y2={cy+r*Math.sin(a)} stroke="#334155" strokeWidth={0.7}/>
+          <text x={lx} y={ly} fill="#cbd5e1" fontSize={10} fontWeight={600} textAnchor="middle" dominantBaseline="middle">{d.l}</text></g>;})}
+      {/* Avg PGA Tour Course reference (dashed, near center since avg deviation ≈ 0) */}
+      <polygon points={polyPts(data.map(()=>avgLevel))} fill="none" stroke="#64748b" strokeWidth={1.2} strokeDasharray="4,3"/>
+      {data.map((d,i)=>{const p=pt(avgLevel,i);return<circle key={"a"+i} cx={p[0]} cy={p[1]} r={2.5} fill="#64748b"/>;})}
+      {/* This course shape */}
+      <polygon points={polyPts(data.map(d=>d.scaled))} fill="rgba(34,211,238,0.18)" stroke="#22d3ee" strokeWidth={2.5}/>
+      {data.map((d,i)=>{const p=pt(d.scaled,i);return<circle key={i} cx={p[0]} cy={p[1]} r={4.5} fill="#22d3ee" stroke="#0a0e17" strokeWidth={1.5}/>;})}
+      {/* Value labels */}
+      {data.map((d,i)=>{const labelR=Math.max(d.scaled+0.1,0.25);const p=pt(labelR,i);
+        return <text key={"v"+i} x={p[0]} y={p[1]-(d.scaled>0.5?12:i>=2?12:-12)} fill="#e2e8f0" fontSize={10} textAnchor="middle" fontWeight={700}>{d.scaled.toFixed(2)}</text>;})}
+      {/* Legend */}
+      <line x1={size/2-80} y1={size+8} x2={size/2-60} y2={size+8} stroke="#64748b" strokeWidth={1.2} strokeDasharray="4,3"/>
+      <circle cx={size/2-70} cy={size+8} r={2} fill="#64748b"/>
+      <text x={size/2-55} y={size+11} fill="#94a3b8" fontSize={8}>Avg PGA TOUR Course</text>
+      <rect x={size/2+30} y={size+4} width={10} height={8} rx={1} fill="rgba(34,211,238,0.18)" stroke="#22d3ee" strokeWidth={1}/>
+      <text x={size/2+45} y={size+11} fill="#94a3b8" fontSize={8}>{courseName||"This Course"}</text>
+    </svg>
+    <div style={{fontSize:9,color:"#64748b",marginTop:4,maxWidth:360,margin:"4px auto 0",lineHeight:1.5}}>
+      Each axis shows how strongly a skill category predicts performance at this course relative to all PGA Tour courses. Higher values (closer to 1.0) mean that category differentiates players more here than at a typical course. Based on course SG difficulty characteristics scaled 0–1.
+    </div>
   </div>;
 }
 
-/* ══════════ MAIN APP ══════════ */
+/* ══ PasteBox ══ */
+function PasteBox({onImport}){const [t,setT]=useState("");const [st,setSt]=useState(null);const [log,setLog]=useState([]);const go=()=>{if(!t.trim())return;const r=onImport(t);setSt(r);if(r.ok){setLog(l=>[...l,r.msg]);setT("");}};
+  return(<div><label style={{fontSize:11,fontWeight:600,color:"#94a3b8",textTransform:"uppercase",letterSpacing:"0.05em"}}>Paste JSON Data</label><div style={{fontSize:10,color:"#64748b",marginBottom:4}}>Auto-detects: decompositions, predictions, skills, odds, matchups, event list.</div>
+    <div style={{position:"relative"}}><textarea value={t} onChange={e=>setT(e.target.value)} rows={4} placeholder="Paste DataGolf JSON..." style={{width:"100%",padding:"9px 11px",fontSize:11,fontFamily:"'JetBrains Mono',monospace",background:"#1e293b",color:"#e2e8f0",border:"1px solid #334155",borderRadius:5,outline:"none",resize:"vertical",boxSizing:"border-box"}}/>{t.trim()&&<button onClick={go} style={{position:"absolute",bottom:8,right:8,padding:"4px 10px",fontSize:10,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:3,cursor:"pointer"}}>Import</button>}</div>
+    {st&&<div style={{fontSize:11,marginTop:3,padding:"4px 7px",borderRadius:3,background:st.ok?"#0a2e1a":"#1c1117",color:st.ok?"#4ade80":"#fca5a5",border:"1px solid "+(st.ok?"#166534":"#7f1d1d")}}>{st.msg}</div>}
+    {log.length>0&&<div style={{marginTop:6,display:"flex",flexWrap:"wrap",gap:3}}>{log.map((l,i)=>(<span key={i} style={{fontSize:9,padding:"2px 5px",borderRadius:3,background:"#164e63",color:"#67e8f9"}}>{l}</span>))}</div>}</div>);
+}
+
+/* ══ PlayerCard ══ */
+function PlayerCard({player:p,n,bankroll,kellyFrac}){
+  const smk={win:"sim_win",top_5:"sim_top5",top_10:"sim_top10",top_20:"sim_top20",make_cut:"sim_make_cut"};
+  const sgMax=Math.max(...[p.sg_dist,p.sg_acc,p.sg_app,p.sg_arg,p.sg_putt].map(v=>Math.abs(v||0)),0.05);
+  const bar=(v)=><div style={{display:"flex",alignItems:"center",gap:6}}><div style={{width:55,textAlign:"right",fontSize:10,color:"#94a3b8"}}>{v>0?"+":""}{(v||0).toFixed(3)}</div><div style={{flex:1,height:7,background:"#1e293b",borderRadius:4,overflow:"hidden"}}><div style={{width:Math.abs((v||0)/sgMax*100)+"%",height:"100%",background:v>=0?"#22c55e":"#ef4444",borderRadius:4}}/></div></div>;
+  return<div style={{padding:"14px 18px",background:"#090d14",display:"grid",gridTemplateColumns:"1fr 1fr",gap:18}}>
+    <div><div style={{fontSize:12,fontWeight:700,color:"#22d3ee",marginBottom:8}}>{p.name} — SG Profile</div>
+      {[["Drv Distance",p.sg_dist],["Drv Accuracy",p.sg_acc],["Approach",p.sg_app],["Around Green",p.sg_arg],["Putting",p.sg_putt]].map(([l,v])=>(<div key={l} style={{marginBottom:6}}><div style={{fontSize:9,color:"#64748b",marginBottom:2,textTransform:"uppercase"}}>{l}</div>{bar(v||0)}</div>))}
+      <div style={{marginTop:10,fontSize:10,color:"#64748b"}}>Base: <b style={{color:"#e2e8f0"}}>{p.baseline?.toFixed(4)||"—"}</b> · CH: <b style={{color:"#e2e8f0"}}>{(p.course_history_adj||0).toFixed(4)}</b> · Fit: <b style={{color:"#e2e8f0"}}>{(p.course_fit_adj||0).toFixed(4)}</b> · Basket: <b style={{color:"#f59e0b"}}>{p.basket_rounds>=MIN_BASKET_ROUNDS?(p.similar_course_adj||0).toFixed(4):"—"}</b>{p.basket_rounds>0&&<span style={{color:"#475569"}}> ({p.basket_rounds}r)</span>}</div></div>
+    <div><div style={{fontSize:12,fontWeight:700,color:"#22d3ee",marginBottom:8}}>Probabilities & DK Odds</div>
+      {MARKETS.map(m=>{const sp=p[smk[m]]||0,od=p.playerOdds?.[m],ciVal=ci95(sp,n);const imp=od?.bestOdds>1?decToImp(od.bestOdds):null;const ev=imp!=null?sp-imp:null;const kb=ev!=null&&ev>0&&od?.bestOdds>1?kellyBet(sp,od.bestOdds,kellyFrac,bankroll):0;
+        return<div key={m} style={{marginBottom:7,padding:"6px 9px",background:"#0f172a",borderRadius:4}}><div style={{display:"flex",justifyContent:"space-between"}}><span style={{fontSize:10,fontWeight:600,color:"#cbd5e1"}}>{MARKET_LABELS[m]}</span><span style={{fontSize:11,fontWeight:700,color:"#22d3ee"}}>{pFmt(sp)}</span></div><div style={{fontSize:9,color:"#64748b",marginTop:1}}>CI: [{pFmt(Math.max(0,sp-ciVal))}, {pFmt(Math.min(1,sp+ciVal))}]</div>{od&&<div style={{fontSize:9,marginTop:3,display:"flex",justifyContent:"space-between",gap:4}}><span style={{color:"#475569"}}>DK {od.bestOdds.toFixed(2)} (imp {pFmt(imp)})</span><span style={{fontWeight:700,color:ev>0.01?"#22c55e":ev<-0.02?"#ef4444":"#64748b"}}>{evFmt(ev)}{kb>0?" · $"+kb.toFixed(2):""}</span></div>}</div>;})}
+    </div></div>;
+}
+
+/* ══════════════════════════════════ */
+/* ══════════  MAIN APP V4.6 ═══════ */
+/* ══════════════════════════════════ */
 function App(){
-  const [tab,setTab]=useState("setup");
+  const [tab,setTab]=useState("setup");const [subTab,setSubTab]=useState("sim_results");
   const [apiKey,setApiKey]=useState("");const [apiKeyInp,setApiKeyInp]=useState("");
   const [loading,setLoading]=useState(false);const [fetchSt,setFetchSt]=useState("");const [error,setError]=useState(null);
   const [ds,setDs]=useState({decomp:null,preds:null,skills:null,odds:{},matchupPairs:[]});
@@ -145,404 +201,386 @@ function App(){
   const [expanded,setExpanded]=useState(null);
   const [bankroll,setBankroll]=useState(1000);const [kellyFrac,setKellyFrac]=useState(0.5);
   const [compareItems,setCompareItems]=useState([]);const [showCompare,setShowCompare]=useState(false);
-  /* Course state */
+  const [showAll,setShowAll]=useState(false);
   const [courseCSV,setCourseCSV]=useState(null);const [courseMatch,setCourseMatch]=useState(null);const [courseMatchManual,setCourseMatchManual]=useState("");
   const [similarCourses,setSimilarCourses]=useState([]);
-  const [courseHistLoading,setCourseHistLoading]=useState(false);const [courseHistStatus,setCourseHistStatus]=useState("");
-  const [courseCorr,setCourseCorr]=useState(null);const [simCourseCorr,setSimCourseCorr]=useState(null);
-  const [playerSimCoursePerf,setPlayerSimCoursePerf]=useState(null);const [fieldComp,setFieldComp]=useState(null);
+  const [playerSimCoursePerf,setPlayerSimCoursePerf]=useState(null);
   const [weatherData,setWeatherData]=useState(null);const [weatherLoading,setWeatherLoading]=useState(false);const [weatherCity,setWeatherCity]=useState("");
+  const [eventList,setEventList]=useState(null);const [eventListLoading,setEventListLoading]=useState(false);const [eventListError,setEventListError]=useState("");
   const [courseHistEventId,setCourseHistEventId]=useState("");const [courseHistYear,setCourseHistYear]=useState("2025");
-  /* Grading state */
+  const [courseHistLoading,setCourseHistLoading]=useState(false);const [courseHistStatus,setCourseHistStatus]=useState("");
+  const [histWeights,setHistWeights]=useState(null);const [histWeightsStatus,setHistWeightsStatus]=useState("");
+  const [fieldMode,setFieldMode]=useState("value");const [fieldSort,setFieldSort]=useState({col:"sg_total",dir:"desc"});
   const [gradingSim,setGradingSim]=useState(null);const [gradeEventId,setGradeEventId]=useState("");const [gradeYear,setGradeYear]=useState("2025");
   const [gradeLoading,setGradeLoading]=useState(false);const [gradeStatus,setGradeStatus]=useState("");
   const [gradeResults,setGradeResults]=useState(null);const [gradeCorr,setGradeCorr]=useState(null);
-  const [eventList,setEventList]=useState(null);const [eventListLoading,setEventListLoading]=useState(false);
 
-  useEffect(()=>{const k=sGet("dg_key");if(k){setApiKey(k);setApiKeyInp(k);}const p=sGet("presets");if(p)setPresets(p);const h=sGet("hist");if(h)setHist(h);const sg=sGet("sgW");if(sg)setSgW(sg);const cx=sGet("ctxW");if(cx)setCtxW(prev=>({...prev,...cx}));const b=sGet("bankroll");if(b)setBankroll(b);const kf=sGet("kf");if(kf!=null)setKellyFrac(kf);const csv=sGet("courseCSV");if(csv)setCourseCSV(csv);},[]);
+  useEffect(()=>{const k=sGet("dg_key");if(k){setApiKey(k);setApiKeyInp(k);}const p=sGet("presets");if(p)setPresets(p);const h=sGet("hist");if(h)setHist(h);const sg=sGet("sgW");if(sg)setSgW(sg);const cx=sGet("ctxW");if(cx)setCtxW(prev=>({...prev,...cx}));const b=sGet("bankroll");if(b)setBankroll(b);const kf=sGet("kf");if(kf!=null)setKellyFrac(kf);const csv=sGet("courseCSV");if(csv)setCourseCSV(csv);const el=sGet("eventList");if(el)setEventList(el);},[]);
   useEffect(()=>{sSet("sgW",sgW);},[sgW]);useEffect(()=>{sSet("ctxW",ctxW);},[ctxW]);
   useEffect(()=>{sSet("bankroll",bankroll);},[bankroll]);useEffect(()=>{sSet("kf",kellyFrac);},[kellyFrac]);
-
   useEffect(()=>{if(!courseCSV||!tourney?.course)return;const m=fuzzyMatch(tourney.course,courseCSV);if(m){setCourseMatch(m);setCourseMatchManual(m.course);const vecs=buildCourseVecs(courseCSV);setSimilarCourses(findSimilarCourses(m.course,vecs,10));}},[courseCSV,tourney]);
 
-  useEffect(()=>{if(!players.length)return;const cats=[{k:"sg_dist",l:"Driving Distance"},{k:"sg_acc",l:"Driving Accuracy"},{k:"sg_app",l:"Approach"},{k:"sg_arg",l:"Around Green"},{k:"sg_putt",l:"Putting"}];
-    setFieldComp(cats.map(c=>{const vals=players.map(p=>p[c.k]||0).sort((a,b)=>a-b);const avg=vals.reduce((a,b)=>a+b,0)/vals.length;const std=Math.sqrt(vals.reduce((a,v)=>a+(v-avg)**2,0)/vals.length);return{...c,avg,std,min:vals[0],max:vals[vals.length-1],spread:vals[vals.length-1]-vals[0]};}));
-  },[players]);
+  /* ── Course characteristic radar from CSV ── */
+  const courseRadarData=useMemo(()=>buildCourseRadar(courseMatch,courseCSV),[courseMatch,courseCSV]);
 
   const saveKey=()=>{const k=apiKeyInp.trim();setApiKey(k);sSet("dg_key",k);setError(null);};
   const parseMatchupPairs=(ma)=>{const pairs=[];(findArr(ma)||[]).forEach(m=>{const id1=m.p1_dg_id||m.player1_dg_id||null,id2=m.p2_dg_id||m.player2_dg_id||null;const n1=m.player1||m.p1_player_name||"",n2=m.player2||m.p2_player_name||"";let dk1=0,dk2=0;Object.entries(m).forEach(([k,v])=>{if(typeof v!=="number")return;const kl=k.toLowerCase().replace(/[\s_]/g,"");if(KNOWN_BOOKS.some(b=>kl.includes(b))){if(kl.includes("p1")||kl.includes("player1"))dk1=Math.max(dk1,v);if(kl.includes("p2")||kl.includes("player2"))dk2=Math.max(dk2,v);}});if(id1&&id2)pairs.push({id1,id2,name1:n1||String(id1),name2:n2||String(id2),dk1,dk2});});return pairs;};
 
   const mergeAll=useCallback((decomp,preds,skills,odds,mp,ti)=>{
     const da=findArr(decomp)||[],pa=findArr(preds)||[],sa=findArr(skills)||[];
-    const mk=a=>{const m={};a.forEach(p=>{const k=p.dg_id||p.player_name;if(k)m[k]=p;});return m;};
-    const pm=mk(pa),sm=mk(sa);
+    const mk=a=>{const m={};a.forEach(p=>{const k=p.dg_id||p.player_name;if(k)m[k]=p;});return m;};const pm=mk(pa),sm=mk(sa);
     const om={};Object.entries(odds||{}).forEach(([mkt,d])=>{om[mkt]={};(findArr(d)||[]).forEach(p=>{const k=p.dg_id||p.player_name;if(k)om[mkt][k]=p;});});
     const src=da.length?da:pa.length?pa:[];
-    const merged=src.map(p=>{
-      const id=p.dg_id||p.player_name;if(!id)return null;const sk=sm[id]||{},pr=pm[id]||{};
-      const sg_dist=p.driving_distance_adjustment||0,sg_acc=p.driving_accuracy_adjustment||0;
-      const sg_app=p.cf_approach_comp??p.approach??sk.sg_app??0,sg_arg=p.cf_short_comp??p.around_the_green??sk.sg_arg??0,sg_putt=p.putting_adjustment??p.putting??sk.sg_putt??0;
+    const merged=src.map(p=>{const id=p.dg_id||p.player_name;if(!id)return null;const sk=sm[id]||{},pr=pm[id]||{};
+      const sg_dist=p.driving_distance_adjustment||0,sg_acc=p.driving_accuracy_adjustment||0;const sg_app=p.cf_approach_comp??p.approach??sk.sg_app??0,sg_arg=p.cf_short_comp??p.around_the_green??sk.sg_arg??0,sg_putt=p.putting_adjustment??p.putting??sk.sg_putt??0;
       const ch=p.course_history_adjustment||p.course_experience_adjustment||0,cf=p.total_fit_adjustment||0,rf=p.true_sg_adjustments||0;
-      const playerOdds={};
-      MARKETS.forEach(mkt=>{const od=om[mkt]?.[id];if(!od)return;let best=0,bBook="";Object.entries(od).forEach(([k,v])=>{if(typeof v==="number"&&v>1&&KNOWN_BOOKS.some(b=>k.toLowerCase().replace(/[\s_]/g,"").includes(b))){if(v>best){best=v;bBook=k;}}});if(best>1)playerOdds[mkt]={bestOdds:best,bestBook:bBook,dgProb:od.dg_prob||od.datagolf_base_history_fit||0};});
-      return{id,name:p.player_name||p.name||String(id),country:p.country||"",sg_dist,sg_acc,sg_app,sg_arg,sg_putt,baseline:p.baseline_pred||0,course_history_adj:ch,course_fit_adj:cf,recent_form_adj:rf,similar_course_adj:0,dg_win:pr.win||0,dg_top5:pr.top_5||0,dg_top10:pr.top_10||0,dg_top20:pr.top_20||0,dg_make_cut:pr.make_cut||0,playerOdds};
-    }).filter(p=>p&&(Math.abs(p.baseline)>0.001||p.dg_win>0||Math.abs(p.sg_dist+p.sg_acc+p.sg_app+p.sg_arg+p.sg_putt)>0.001));
+      const playerOdds={};MARKETS.forEach(mkt=>{const od=om[mkt]?.[id];if(!od)return;let best=0,bBook="";Object.entries(od).forEach(([k,v])=>{if(typeof v==="number"&&v>1&&KNOWN_BOOKS.some(b=>k.toLowerCase().replace(/[\s_]/g,"").includes(b))){if(v>best){best=v;bBook=k;}}});if(best>1)playerOdds[mkt]={bestOdds:best,bestBook:bBook};});
+      return{id,name:p.player_name||p.name||String(id),country:p.country||"",sg_dist,sg_acc,sg_app,sg_arg,sg_putt,sg_total:sg_dist+sg_acc+sg_app+sg_arg+sg_putt,baseline:p.baseline_pred||0,course_history_adj:ch,course_fit_adj:cf,recent_form_adj:rf,similar_course_adj:0,basket_rounds:0,dg_win:pr.win||0,dg_top5:pr.top_5||0,dg_top10:pr.top_10||0,dg_top20:pr.top_20||0,dg_make_cut:pr.make_cut||0,playerOdds};
+    }).filter(p=>p&&(Math.abs(p.baseline)>0.001||p.dg_win>0||Math.abs(p.sg_total)>0.001));
     setPlayers(merged);setDs(d=>({...d,matchupPairs:mp||[]}));if(ti)setTourney(ti);setH2hData(null);
   },[]);
 
-  const fetchAll=async(pi=0)=>{
-    if(!apiKey){setError("Save API key first.");return;}setLoading(true);setError(null);setFetchSt("Trying "+PROXIES[pi]?.name+"...");
-    const f=(path,par)=>dgFetch(path,par,pi),par={key:apiKey,tour:"pga"};
-    try{
-      setFetchSt("["+PROXIES[pi]?.name+"] Field...");const field=await f("/field-updates",par);
-      const ti={name:field?.event_name||"Tournament",course:field?.course||"",city:field?.city||field?.location||""};
-      setFetchSt("["+PROXIES[pi]?.name+"] Decompositions...");const decomp=await f("/preds/player-decompositions",par);
-      setFetchSt("["+PROXIES[pi]?.name+"] Predictions...");const preds=await f("/preds/pre-tournament",{...par,odds_format:"percent"});
-      setFetchSt("["+PROXIES[pi]?.name+"] Skills...");const skills=await f("/preds/skill-ratings",{...par,display:"value"});
-      setFetchSt("["+PROXIES[pi]?.name+"] Odds...");const odds={};
-      await Promise.all(MARKETS.map(async m=>{try{odds[m]=await f("/betting-tools/outrights",{...par,market:m,odds_format:"decimal"});}catch{}}));
-      setFetchSt("["+PROXIES[pi]?.name+"] Matchups...");let mu=[];try{mu=await f("/betting-tools/matchups",{...par,market:"tournament_matchups",odds_format:"decimal"});}catch{}
+  const fetchAll=async(pi=0)=>{if(!apiKey){setError("Save API key first.");return;}setLoading(true);setError(null);setFetchSt("Trying "+PROXIES[pi]?.name+"...");const f=(path,par)=>dgFetch(path,par,pi),par={key:apiKey,tour:"pga"};
+    try{setFetchSt("["+PROXIES[pi]?.name+"] Field...");const field=await f("/field-updates",par);const ti={name:field?.event_name||"Tournament",course:field?.course||"",city:field?.city||field?.location||""};setFetchSt("["+PROXIES[pi]?.name+"] Decomp...");const decomp=await f("/preds/player-decompositions",par);setFetchSt("["+PROXIES[pi]?.name+"] Preds...");const preds=await f("/preds/pre-tournament",{...par,odds_format:"percent"});setFetchSt("["+PROXIES[pi]?.name+"] Skills...");const skills=await f("/preds/skill-ratings",{...par,display:"value"});setFetchSt("["+PROXIES[pi]?.name+"] Odds...");const odds={};await Promise.all(MARKETS.map(async m=>{try{odds[m]=await f("/betting-tools/outrights",{...par,market:m,odds_format:"decimal"});}catch{}}));setFetchSt("["+PROXIES[pi]?.name+"] Matchups...");let mu=[];try{mu=await f("/betting-tools/matchups",{...par,market:"tournament_matchups",odds_format:"decimal"});}catch{}
       setDs({decomp,preds,skills,odds,matchupPairs:[]});mergeAll(decomp,preds,skills,odds,parseMatchupPairs(mu),ti);setFetchSt("");setTab("course");
-    }catch(e){if(pi<PROXIES.length-1){setLoading(false);return fetchAll(pi+1);}setError("All proxies failed. Use Quick Import.");setFetchSt("");}setLoading(false);
-  };
+    }catch(e){if(pi<PROXIES.length-1){setLoading(false);return fetchAll(pi+1);}setError("All proxies failed. Use Quick Import.");setFetchSt("");}setLoading(false);};
 
-  const handleImport=(text)=>{
-    try{const raw=JSON.parse(text.trim());const arr=findArr(raw);const meta=!Array.isArray(raw)&&typeof raw==="object"?raw:{};
-      if(!arr||!arr.length)return{ok:false,msg:"No array found."};const s=arr[0];let type,label;
-      if(s.baseline_pred!==undefined||s.driving_accuracy_adjustment!==undefined||s.cf_approach_comp!==undefined||s.total_fit_adjustment!==undefined){type="decomp";label="Decompositions ("+arr.length+")";}
-      else if(s.win!==undefined&&s.make_cut!==undefined&&s.baseline_pred===undefined&&s.dg_prob===undefined){type="preds";label="Predictions ("+arr.length+")";}
-      else if(s.sg_total!==undefined||(s.sg_ott!==undefined&&s.baseline_pred===undefined)){type="skills";label="Skill Ratings ("+arr.length+")";}
-      else if(s.dg_prob!==undefined||Object.keys(s).some(k=>KNOWN_BOOKS.some(b=>k.toLowerCase().includes(b)))){type="odds";label="Odds ("+arr.length+")";}
-      else if(s.p1_player_name!==undefined||s.player1!==undefined||s.p1_dg_id!==undefined){type="matchups";label="Matchups ("+arr.length+")";}
-      else if(s.player_name||s.dg_id){type="decomp";label="Player data ("+arr.length+")";}
-      else return{ok:false,msg:"Unknown format."};
-      const nds={...ds};const ti={name:meta.event_name||tourney?.name||"Imported",course:meta.course||tourney?.course||"",city:meta.city||tourney?.city||""};let mp=ds.matchupPairs||[];
-      if(type==="decomp")nds.decomp=arr;else if(type==="preds")nds.preds=arr;else if(type==="skills")nds.skills=arr;else if(type==="odds"){nds.odds={...nds.odds,[meta.market||"win"]:arr};}else if(type==="matchups"){mp=parseMatchupPairs(arr);}
-      setDs(nds);mergeAll(nds.decomp,nds.preds,nds.skills,nds.odds,mp,ti);return{ok:true,msg:"✓ "+label,type};
-    }catch(e){return{ok:false,msg:"Invalid JSON: "+e.message};}
-  };
+  const handleImport=(text)=>{try{const raw=JSON.parse(text.trim());const arr=findArr(raw);const meta=!Array.isArray(raw)&&typeof raw==="object"?raw:{};
+    if(arr?.length&&arr[0].event_id!==undefined&&arr[0].event_name!==undefined){const season=meta.season||meta.calendar_year||null;const withYear=arr.map(e=>({...e,calendar_year:e.calendar_year||e.year||season||(e.start_date?parseInt(e.start_date):null)||2025}));const sorted=withYear.sort((a,b)=>(b.calendar_year||0)-(a.calendar_year||0));setEventList(sorted);sSet("eventList",sorted);setEventListError("");return{ok:true,msg:"✓ Event List ("+sorted.length+" events)"};}
+    if(!arr||!arr.length)return{ok:false,msg:"No array found."};const s=arr[0];let type,label;
+    if(s.baseline_pred!==undefined||s.driving_accuracy_adjustment!==undefined||s.cf_approach_comp!==undefined){type="decomp";label="Decompositions ("+arr.length+")";}
+    else if(s.win!==undefined&&s.make_cut!==undefined&&s.baseline_pred===undefined&&s.dg_prob===undefined){type="preds";label="Predictions ("+arr.length+")";}
+    else if(s.sg_total!==undefined||(s.sg_ott!==undefined&&s.baseline_pred===undefined)){type="skills";label="Skill Ratings ("+arr.length+")";}
+    else if(s.dg_prob!==undefined||Object.keys(s).some(k=>KNOWN_BOOKS.some(b=>k.toLowerCase().includes(b)))){type="odds";label="Odds ("+arr.length+")";}
+    else if(s.p1_player_name!==undefined||s.player1!==undefined||s.p1_dg_id!==undefined){type="matchups";label="Matchups ("+arr.length+")";}
+    else if(s.player_name||s.dg_id){type="decomp";label="Player data ("+arr.length+")";}
+    else return{ok:false,msg:"Unknown format."};
+    const nds={...ds};const ti={name:meta.event_name||tourney?.name||"Imported",course:meta.course||tourney?.course||"",city:meta.city||tourney?.city||""};let mp=ds.matchupPairs||[];
+    if(type==="decomp")nds.decomp=arr;else if(type==="preds")nds.preds=arr;else if(type==="skills")nds.skills=arr;else if(type==="odds"){nds.odds={...nds.odds,[meta.market||"win"]:arr};}else if(type==="matchups"){mp=parseMatchupPairs(arr);}
+    setDs(nds);mergeAll(nds.decomp,nds.preds,nds.skills,nds.odds,mp,ti);return{ok:true,msg:"✓ "+label};
+  }catch(e){return{ok:false,msg:"Invalid JSON: "+e.message};}};
 
   const adjSG=(field,val)=>{const c={...sgW};const old=c[field];const diff=val-old;const oth=Object.keys(c).filter(k=>k!==field);const othSum=oth.reduce((s,k)=>s+c[k],0);if(othSum===0){c[field]=Math.min(100,Math.max(0,val));}else{c[field]=val;oth.forEach(k=>{c[k]=Math.max(0,Math.round(c[k]-diff*(c[k]/othSum)));});const tot=Object.values(c).reduce((s,v)=>s+v,0);if(tot!==100){const lg=oth.sort((a,b)=>c[b]-c[a])[0];c[lg]+=100-tot;}}setSgW(c);};
 
-  const doSim=useCallback(async()=>{
-    if(!players.length)return;setSimRunning(true);await new Promise(r=>setTimeout(r,50));
+  const doSim=useCallback(async()=>{if(!players.length)return;setSimRunning(true);await new Promise(r=>setTimeout(r,50));
     const w={sg_dist:sgW.dist/100,sg_acc:sgW.acc/100,sg_app:sgW.app/100,sg_arg:sgW.arg/100,sg_putt:sgW.putt/100,course_history:ctxW.ch/100,course_fit:ctxW.cf/100,recent_form:ctxW.rf/100,similar_course:ctxW.sc/100};
     const {results,allScores:scores}=runSim(players,w,simCount);setSimRes(results);setAllScores(scores);
     if(scores&&ds.matchupPairs.length>0)setH2hData(computeH2H(scores,players,ds.matchupPairs.slice(0,300)));else setH2hData(null);
-    setSimRunning(false);setTab("results");
+    setSimRunning(false);setTab("results");setSubTab("sim_results");
     const e={id:Date.now(),date:new Date().toISOString(),t:tourney?.name,n:simCount,sg:{...sgW},cx:{...ctxW},top30:results.slice().sort((a,b)=>b.sim_win-a.sim_win).slice(0,30).map(p=>({id:p.id,n:p.name,w:p.sim_win,t5:p.sim_top5,t10:p.sim_top10,t20:p.sim_top20,mc:p.sim_make_cut}))};
     const h=[e,...hist].slice(0,20);setHist(h);sSet("hist",h);
   },[players,sgW,ctxW,simCount,tourney,hist,ds.matchupPairs]);
 
-  /* ── Event list for dropdowns ── */
-  const [eventListError,setEventListError]=useState("");
-  const [eventPasteOpen,setEventPasteOpen]=useState(false);const [eventPasteText,setEventPasteText]=useState("");
-  const fetchEventList=async()=>{
-    setEventListLoading(true);setEventListError("");const apiK=apiKey||DG_KEY_HIST;
-    for(let pi=0;pi<PROXIES.length;pi++){
-      try{
-        const d=await dgFetch("/historical-event-data/events",{key:apiK,tour:"pga"},pi);const arr=findArr(d);
-        if(arr?.length){const sorted=arr.sort((a,b)=>(b.calendar_year||0)-(a.calendar_year||0));setEventList(sorted);sSet("eventList",sorted);setEventListLoading(false);return;}
-      }catch(e){console.log("Proxy "+PROXIES[pi].name+" failed:",e);}
-    }
-    setEventListError("Proxies failed — use Open ↗ then paste below.");setEventPasteOpen(true);setEventListLoading(false);
-  };
-  const importEventList=(text)=>{
-    try{const raw=JSON.parse(text.trim());const arr=findArr(raw);
-      if(arr?.length){const sorted=arr.sort((a,b)=>(b.calendar_year||0)-(a.calendar_year||0));setEventList(sorted);sSet("eventList",sorted);setEventPasteOpen(false);setEventPasteText("");setEventListError("");return true;}
-    }catch{}return false;
-  };
-  const eventListUrl=DG_BASE+"/historical-event-data/events?tour=pga&file_format=json&key="+(apiKey||DG_KEY_HIST);
-  useEffect(()=>{const cached=sGet("eventList");if(cached)setEventList(cached);},[]);
+  const dgFetchRetry=async(path,params)=>{const apiK=apiKey||DG_KEY_HIST;const p={...params,key:params.key||apiK};for(let pi=0;pi<PROXIES.length;pi++){try{return await dgFetch(path,p,pi);}catch{}}throw new Error("All proxies failed");};
+  const parseRoundsData=(d,extraFields={})=>{const raw=d?.scores||findArr(d);if(!raw?.length)return[];const rounds=[];raw.forEach(p=>{const finText=p.fin_text||p.finish_position||p.position||p.fin||"";let foundNested=false;for(let r=1;r<=4;r++){const rd=p["round_"+r];if(rd&&(rd.sg_app!==undefined||rd.sg_ott!==undefined)){foundNested=true;rounds.push({...rd,dg_id:p.dg_id,player_name:p.player_name,fin_text:finText,...extraFields});}}if(!foundNested&&(p.sg_app!==undefined||p.sg_ott!==undefined)){rounds.push({sg_ott:p.sg_ott||0,sg_app:p.sg_app||0,sg_arg:p.sg_arg||0,sg_putt:p.sg_putt||0,sg_total:p.sg_total||0,dg_id:p.dg_id,player_name:p.player_name,fin_text:finText,...extraFields});}});return rounds;};
 
-  const handleCourseEventSelect=(val)=>{
-    if(!val){setCourseHistEventId("");return;}
-    const [eid,yr]=val.split("|");setCourseHistEventId(eid);setCourseHistYear(yr||"2025");
-  };
-  const handleGradeEventSelect=(val)=>{
-    if(!val){setGradeEventId("");return;}
-    const [eid,yr]=val.split("|");setGradeEventId(eid);setGradeYear(yr||"2025");
-  };
+  const fetchEventList=async()=>{setEventListLoading(true);setEventListError("");const apiK=apiKey||DG_KEY_HIST;const seasons=[2026,2025,2024,2023,2022,2021,2020];let allEvts=[];
+    for(let pi=0;pi<PROXIES.length;pi++){try{for(const season of seasons){try{const d=await dgFetch("/get-schedule",{key:apiK,tour:"pga",season:String(season)},pi);const arr=findArr(d);if(arr?.length)allEvts=allEvts.concat(arr.map(e=>({...e,calendar_year:e.calendar_year||e.year||season,event_id:e.event_id||""})));}catch{}}if(allEvts.length){const sorted=allEvts.sort((a,b)=>(b.calendar_year||0)-(a.calendar_year||0));setEventList(sorted);sSet("eventList",sorted);setEventListLoading(false);return;}}catch{}}
+    setEventListError("Proxies failed — use Open ↗ then paste.");setEventListLoading(false);};
+  const eventListUrl=DG_BASE+"/get-schedule?tour=pga&season=2025&file_format=json&key="+(apiKey||DG_KEY_HIST);
+  const handleEventSelect=(val,setEid,setYr)=>{if(!val){setEid("");return;}const [eid,yr]=val.split("|");setEid(eid);setYr(yr||"2025");};
 
-  /* ── Course: fetch historical ── */
-  const fetchCourseHist=async()=>{
-    if(!courseHistEventId)return;setCourseHistLoading(true);setCourseHistStatus("Fetching...");
-    const apiK=apiKey||DG_KEY_HIST;const sgCats=[{k:"sg_ott",l:"Off the Tee"},{k:"sg_app",l:"Approach"},{k:"sg_arg",l:"Around Green"},{k:"sg_putt",l:"Putting"},{k:"sg_t2g",l:"Tee to Green"}];
-    try{
-      const years=[2025,2024,2023,2022,2021,2020,2019];let allRounds=[];
-      for(const yr of years){setCourseHistStatus("Fetching "+courseHistEventId+" "+yr+"...");try{const d=await dgFetch("/historical-raw-data/rounds",{key:apiK,tour:"pga",event_id:courseHistEventId,year:yr},0);const arr=findArr(d);if(arr?.length)allRounds=allRounds.concat(arr.map(r=>({...r,year:yr})));}catch{}}
-      if(!allRounds.length){setCourseHistStatus("No data found.");setCourseHistLoading(false);return;}
-      const byP={};allRounds.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;const key=pid+"_"+r.year;if(!byP[key])byP[key]={pid,name:r.player_name||pid,year:r.year,rounds:0,finish:r.fin_num||r.finish_position||999,sg_ott:0,sg_app:0,sg_arg:0,sg_putt:0,sg_t2g:0};const p=byP[key];p.rounds++;p.sg_ott+=(r.sg_ott||r.sg_off_the_tee||0);p.sg_app+=(r.sg_app||r.sg_approach||0);p.sg_arg+=(r.sg_arg||r.sg_around_the_green||0);p.sg_putt+=(r.sg_putt||r.sg_putting||0);p.sg_t2g+=(r.sg_t2g||r.sg_tee_to_green||0);if(r.fin_num||r.finish_position)p.finish=Math.min(p.finish,r.fin_num||r.finish_position||999);});
-      const entries=Object.values(byP).filter(p=>p.rounds>=3&&p.finish<900);
-      if(entries.length>=10){const finishes=entries.map(e=>e.finish);setCourseCorr({corrs:sgCats.map(c=>({...c,corr:spearmanCorr(entries.map(e=>e[c.k]),finishes),n:entries.length})),n:entries.length,rounds:allRounds.length,years:years.filter(y=>allRounds.some(r=>r.year===y))});}
-
-      /* similar courses */
-      if(similarCourses.length>0){
-        setCourseHistStatus("Fetching similar course data...");let simRounds=[];
-        try{const evts=await dgFetch("/historical-event-data/events",{key:apiK,tour:"pga"},0);const evtArr=findArr(evts)||[];
-          const simNames=similarCourses.slice(0,5).map(c=>c.course.toLowerCase());
-          const matched=evtArr.filter(e=>{const cn=(e.course||"").toLowerCase();return simNames.some(sc=>cn.includes(sc.substring(0,15))||sc.includes(cn.substring(0,15)));});
-          for(const evt of matched.slice(0,15)){setCourseHistStatus("Fetching "+evt.event_id+" "+evt.calendar_year+"...");try{const d=await dgFetch("/historical-raw-data/rounds",{key:apiK,tour:"pga",event_id:evt.event_id,year:evt.calendar_year},0);const arr=findArr(d);if(arr?.length)simRounds=simRounds.concat(arr);}catch{}}
-        }catch{}
-        if(simRounds.length>0){
-          const byP2={};simRounds.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;const key=pid+"_"+(r.year||"")+"_"+(r.event_name||"");if(!byP2[key])byP2[key]={pid,name:r.player_name||pid,rounds:0,finish:r.fin_num||r.finish_position||999,sg_ott:0,sg_app:0,sg_arg:0,sg_putt:0,sg_t2g:0};const p=byP2[key];p.rounds++;p.sg_ott+=(r.sg_ott||r.sg_off_the_tee||0);p.sg_app+=(r.sg_app||r.sg_approach||0);p.sg_arg+=(r.sg_arg||r.sg_around_the_green||0);p.sg_putt+=(r.sg_putt||r.sg_putting||0);p.sg_t2g+=(r.sg_t2g||r.sg_tee_to_green||0);if(r.fin_num||r.finish_position)p.finish=Math.min(p.finish,r.fin_num||r.finish_position||999);});
-          const se=Object.values(byP2).filter(p=>p.rounds>=3&&p.finish<900);
-          if(se.length>=10){const sf=se.map(e=>e.finish);setSimCourseCorr({corrs:sgCats.map(c=>({...c,corr:spearmanCorr(se.map(e=>e[c.k]),sf),n:se.length})),n:se.length,rounds:simRounds.length});}
-          /* player perf at similar courses */
-          const pa={};simRounds.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;if(!pa[pid])pa[pid]={name:r.player_name,rounds:0,sg_total:0};const p=pa[pid];p.rounds++;p.sg_total+=(r.sg_total||0);});
-          Object.values(pa).forEach(p=>{if(p.rounds>0)p.sg_total/=p.rounds;});
-          setPlayerSimCoursePerf(pa);
-          setPlayers(prev=>prev.map(pl=>{const perf=pa[pl.id]||pa[pl.name];return{...pl,similar_course_adj:perf?perf.sg_total:0};}));
-        }
-      }
-      setCourseHistStatus("✓ Analysis complete");
-    }catch(e){setCourseHistStatus("Error: "+e.message);}setCourseHistLoading(false);
+  /* ── Combined Course Analysis ── */
+  const fetchCourseHist=async()=>{if(!courseHistEventId)return;
+    setPlayerSimCoursePerf(null);setHistWeights(null);setHistWeightsStatus("");
+    setCourseHistLoading(true);setCourseHistStatus("Fetching...");
+    const years=[2026,2025,2024,2023,2022,2021,2020,2019];let allRounds=[];const yearData=[];let yearsWithData=0;
+    for(const yr of years){setCourseHistStatus("Fetching "+yr+"...");
+      try{const d=await dgFetchRetry("/historical-raw-data/rounds",{tour:"pga",event_id:courseHistEventId,year:yr});
+        const rounds=parseRoundsData(d,{year:yr});
+        if(rounds.length>0){allRounds=allRounds.concat(rounds);yearsWithData++;
+          if(rounds.length>10){const opt=computeOptimalWeights(rounds);if(opt)yearData.push({year:yr,opt,rounds:rounds.length});}}}catch{}}
+    if(!allRounds.length){setCourseHistStatus("No data found.");setCourseHistLoading(false);return;}
+    /* Per-year historical weights (max 5) */
+    if(yearData.length){setHistWeights(yearData.slice(0,5));setHistWeightsStatus("✓ "+yearData.length+" years with weights ("+yearsWithData+" with data)");}
+    else{setHistWeightsStatus("Data found ("+yearsWithData+" yrs) but insufficient per-year sample for weights.");}
+    /* Similar courses: similarity-weighted basket with min rounds */
+    if(similarCourses.length>0&&eventList?.length>0){setCourseHistStatus("Fetching similar courses...");let simRounds=[];
+      const simMap={};similarCourses.forEach(c=>{
+        /* Store multiple name variants for better matching */
+        const full=c.course.toLowerCase();simMap[full]=c.sim;
+        /* Extract key words: strip parentheticals, "resort", "golf", "club", "course" */
+        const core=full.replace(/\(.*?\)/g,"").replace(/\b(resort|golf|club|course|country|national|links)\b/g,"").replace(/[^a-z0-9\s]/g,"").trim().replace(/\s+/g," ");
+        if(core.length>=4)simMap[core]=c.sim;
+      });
+      const simKeys=Object.keys(simMap);
+      const matchEvent=(eName)=>{const en=(eName||"").toLowerCase().replace(/\(.*?\)/g,"").replace(/\b(resort|golf|club|course|country|national|links)\b/g,"").replace(/[^a-z0-9\s]/g,"").trim().replace(/\s+/g," ");
+        for(const sk of simKeys){if(en.includes(sk.substring(0,Math.min(12,sk.length)))||sk.includes(en.substring(0,Math.min(12,en.length))))return simMap[sk];}return null;};
+      const matched=[];eventList.forEach(e=>{const sim=matchEvent(e.course||e.event_name||"");if(sim!==null)matched.push({...e,_simScore:sim});});
+      setCourseHistStatus("Fetching similar courses ("+matched.length+" matched events)...");
+      for(const evt of matched.slice(0,20)){try{const d=await dgFetchRetry("/historical-raw-data/rounds",{tour:"pga",event_id:evt.event_id,year:evt.calendar_year||evt.year});const rounds=parseRoundsData(d);rounds.forEach(r=>r._simWeight=evt._simScore||0.8);simRounds=simRounds.concat(rounds);}catch{}}
+      if(simRounds.length>0){
+        /* Similarity-weighted per-player aggregate */
+        const pa={};simRounds.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;if(!pa[pid])pa[pid]={name:r.player_name,rounds:0,weightedSG:0,totalWeight:0};const w=r._simWeight||0.8;pa[pid].rounds++;pa[pid].weightedSG+=(r.sg_total||0)*w;pa[pid].totalWeight+=w;});
+        Object.values(pa).forEach(p=>{if(p.totalWeight>0)p.sg_avg=p.weightedSG/p.totalWeight;else p.sg_avg=0;});
+        /* Normalize to DG fit scale */
+        const qualified=Object.values(pa).filter(p=>p.rounds>=MIN_BASKET_ROUNDS);
+        const rawVals=qualified.map(p=>p.sg_avg);
+        const rawMean=rawVals.length?rawVals.reduce((a,b)=>a+b,0)/rawVals.length:0;
+        const rawStd=rawVals.length>1?Math.sqrt(rawVals.reduce((s,v)=>s+(v-rawMean)**2,0)/rawVals.length):1;
+        const fitVals=players.map(p=>p.course_fit_adj||0).filter(v=>Math.abs(v)>0.001);
+        const fitMean=fitVals.length?fitVals.reduce((a,b)=>a+b,0)/fitVals.length:0;
+        const fitStd=fitVals.length>1?Math.sqrt(fitVals.reduce((s,v)=>s+(v-fitMean)**2,0)/fitVals.length):0.15;
+        Object.values(pa).forEach(p=>{p.basket_fit=p.rounds>=MIN_BASKET_ROUNDS&&rawStd>0.001?((p.sg_avg-rawMean)/rawStd)*fitStd+fitMean:0;});
+        setPlayerSimCoursePerf(pa);
+        setPlayers(prev=>prev.map(pl=>{const perf=pa[pl.id]||pa[pl.name];return{...pl,similar_course_adj:perf&&perf.rounds>=MIN_BASKET_ROUNDS?perf.basket_fit:0,basket_rounds:perf?perf.rounds:0};}));}}
+    setCourseHistStatus("✓ Analysis complete ("+allRounds.length+" rounds)");setCourseHistLoading(false);
   };
 
-  const fetchWeather=async()=>{const city=weatherCity.trim()||tourney?.city||tourney?.course||"";if(!city){setWeatherData({error:"Enter a city name"});return;}setWeatherLoading(true);
-    try{const r=await fetch("https://api.weatherapi.com/v1/forecast.json?key="+WEATHER_KEY+"&q="+encodeURIComponent(city)+"&days=7&aqi=no");const d=await r.json();setWeatherData(d.error?{error:d.error.message}:d);}catch(e){setWeatherData({error:e.message});}setWeatherLoading(false);};
+  const hwAggregate=useMemo(()=>{if(!histWeights)return null;
+    const avg={};SG_CATS.forEach(c=>{avg[c.k]=Math.round(histWeights.reduce((s,y)=>{const f=y.opt.corrs.find(x=>x.k===c.k);return s+(f?.pct||0);},0)/histWeights.length);});
+    const tot=Object.values(avg).reduce((a,b)=>a+b,0)||1;SG_CATS.forEach(c=>{avg[c.k]=Math.round(avg[c.k]/tot*100);});return avg;
+  },[histWeights]);
 
-  /* ── Grading: fetch results ── */
-  const fetchGradeResults=async()=>{
-    if(!gradeEventId)return;setGradeLoading(true);setGradeStatus("Fetching...");const apiK=apiKey||DG_KEY_HIST;
-    try{const d=await dgFetch("/historical-raw-data/rounds",{key:apiK,tour:"pga",event_id:gradeEventId,year:gradeYear},0);const arr=findArr(d);
-      if(!arr?.length){setGradeStatus("No data found.");setGradeLoading(false);return;}
-      const byP={};arr.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;if(!byP[pid])byP[pid]={pid,name:r.player_name||pid,rounds:0,finish:r.fin_num||r.finish_position||999,sg_ott:0,sg_app:0,sg_arg:0,sg_putt:0,sg_total:0};const p=byP[pid];p.rounds++;p.sg_ott+=(r.sg_ott||r.sg_off_the_tee||0);p.sg_app+=(r.sg_app||r.sg_approach||0);p.sg_arg+=(r.sg_arg||r.sg_around_the_green||0);p.sg_putt+=(r.sg_putt||r.sg_putting||0);p.sg_total+=(r.sg_total||0);if(r.fin_num||r.finish_position)p.finish=Math.min(p.finish,r.fin_num||r.finish_position||999);});
-      const results=Object.values(byP).sort((a,b)=>a.finish-b.finish);setGradeResults(results);
+  const fetchWeather=async()=>{const city=weatherCity.trim()||tourney?.city||tourney?.course||"";if(!city){setWeatherData({error:"Enter a city"});return;}setWeatherLoading(true);try{const r=await fetch("https://api.weatherapi.com/v1/forecast.json?key="+WEATHER_KEY+"&q="+encodeURIComponent(city)+"&days=7&aqi=no");const d=await r.json();setWeatherData(d.error?{error:d.error.message}:d);}catch(e){setWeatherData({error:e.message});}setWeatherLoading(false);};
+  const weatherInsights=useMemo(()=>{if(!weatherData?.forecast)return null;const days=weatherData.forecast.forecastday;const avgWind=days.reduce((s,d)=>s+(d.day.maxwind_mph||0),0)/days.length;const avgRain=days.reduce((s,d)=>s+(d.day.daily_chance_of_rain||0),0)/days.length;const avgTemp=days.reduce((s,d)=>s+(d.day.avgtemp_f||0),0)/days.length;const maxWind=Math.max(...days.map(d=>d.day.maxwind_mph||0));const totalPrecip=days.reduce((s,d)=>s+(d.day.totalprecip_in||0),0);const tips=[];
+    if(avgWind>=20)tips.push({icon:"💨",text:"Very windy (avg "+avgWind.toFixed(0)+"mph). Boost Driving Accuracy and Approach."});else if(avgWind>=15)tips.push({icon:"💨",text:"Moderate wind (avg "+avgWind.toFixed(0)+"mph). Ball strikers have an edge."});else if(avgWind<8)tips.push({icon:"🏌",text:"Calm conditions (avg "+avgWind.toFixed(0)+"mph). Distance matters more."});
+    if(totalPrecip>=1.5)tips.push({icon:"🌧",text:"Significant rain ("+totalPrecip.toFixed(1)+"in). Soft greens reward approach accuracy."});else if(avgRain>=40)tips.push({icon:"🌧",text:"Rain likely ("+avgRain.toFixed(0)+"%). Course plays longer/softer."});
+    if(totalPrecip<0.1&&avgTemp>=80)tips.push({icon:"☀️",text:"Hot and dry ("+avgTemp.toFixed(0)+"°F). Firm/fast — short game premium."});
+    if(maxWind>=25)tips.push({icon:"⚠️",text:"Gusts to "+maxWind.toFixed(0)+"mph on at least one day. Scrambling matters."});
+    return tips.length?{tips}:null;
+  },[weatherData]);
+
+  const fetchGradeResults=async()=>{if(!gradeEventId)return;setGradeLoading(true);setGradeStatus("Fetching...");setGradeResults(null);setGradeCorr(null);
+    try{const d=await dgFetchRetry("/historical-raw-data/rounds",{tour:"pga",event_id:gradeEventId,year:gradeYear});const rounds=parseRoundsData(d);
+      if(!rounds.length){setGradeStatus("No data.");setGradeLoading(false);return;}
+      const byP={};rounds.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;if(!byP[pid])byP[pid]={pid,name:r.player_name,finish:999,rounds:0,sg_ott:0,sg_app:0,sg_arg:0,sg_putt:0};const p=byP[pid];p.rounds++;p.sg_ott+=(r.sg_ott||0);p.sg_app+=(r.sg_app||0);p.sg_arg+=(r.sg_arg||0);p.sg_putt+=(r.sg_putt||0);const fn=parseInt(String(r.fin_text).replace(/\D/g,""))||999;p.finish=Math.min(p.finish,fn);});
+      const results=Object.values(byP).filter(r=>r.rounds>0).sort((a,b)=>a.finish-b.finish);setGradeResults(results);
       const valid=results.filter(r=>r.rounds>=3&&r.finish<900);
-      if(valid.length>=10){const fin=valid.map(r=>r.finish);const sgC=[{k:"sg_ott",l:"Off the Tee"},{k:"sg_app",l:"Approach"},{k:"sg_arg",l:"Around Green"},{k:"sg_putt",l:"Putting"}];
-        const corrs=sgC.map(c=>({...c,corr:spearmanCorr(valid.map(r=>r[c.k]),fin),n:valid.length}));
-        const abs=corrs.map(c=>Math.abs(c.corr));const tot=abs.reduce((a,b)=>a+b,0)||1;
-        setGradeCorr({corrs:corrs.map((c,i)=>({...c,suggestedPct:Math.round(abs[i]/tot*100)})),n:valid.length});}
-      setGradeStatus("✓ Loaded "+results.length+" players");
-    }catch(e){setGradeStatus("Error: "+e.message);}setGradeLoading(false);
-  };
+      if(valid.length>=10){const fin=valid.map(r=>r.finish);const corrs=SG_CATS.map(c=>({...c,corr:spearmanCorr(valid.map(r=>r[c.k]),fin)}));const abs=corrs.map(c=>Math.abs(c.corr));const tot=abs.reduce((a,b)=>a+b,0)||1;setGradeCorr({corrs:corrs.map((c,i)=>({...c,suggestedPct:Math.round(abs[i]/tot*100)})),n:valid.length});}
+      setGradeStatus("✓ "+results.length+" players");
+    }catch(e){setGradeStatus("Error: "+e.message);}setGradeLoading(false);};
+
+  /* ── Apply optimal weights + context multipliers ── */
+  const applyOptimal=()=>{if(!hwAggregate)return;const ott=hwAggregate.sg_ott||25;const d=Math.round(ott*OTT_DIST_RATIO);const a=ott-d;const app=hwAggregate.sg_app||25;const arg=hwAggregate.sg_arg||25;const putt=hwAggregate.sg_putt||25;const tot=d+a+app+arg+putt;const adj=100-tot;setSgW({dist:d,acc:a,app:app+adj,arg,putt});};
 
   const savePre=()=>{if(!pName.trim())return;const p={name:pName.trim(),sg:{...sgW},cx:{...ctxW}};const u=[...presets.filter(x=>x.name!==p.name),p];setPresets(u);sSet("presets",u);setPName("");};
   const sorted=useMemo(()=>simRes?[...simRes].sort((a,b)=>{const av=a[sort.col]??0,bv=b[sort.col]??0;return sort.dir==="desc"?bv-av:av-bv;}):[]     ,[simRes,sort]);
-  const evData=useMemo(()=>{if(!simRes)return[];const smk={win:"sim_win",top_5:"sim_top5",top_10:"sim_top10",top_20:"sim_top20",make_cut:"sim_make_cut"};
-    return simRes.map(p=>{const ev={};MARKETS.forEach(m=>{const od=p.playerOdds?.[m];if(od?.bestOdds>1){const imp=decToImp(od.bestOdds);const sp=p[smk[m]]||0;ev["ev_"+m]=sp-imp;ev["sim_"+m]=sp;ev["imp_"+m]=imp;ev["odds_"+m]=od.bestOdds;ev["kelly_"+m]=kellyBet(sp,od.bestOdds,kellyFrac,bankroll);}});return{...p,...ev};}).sort((a,b)=>{const av=a[evS.col]??-999,bv=b[evS.col]??-999;return evS.dir==="desc"?bv-av:av-bv;});},[simRes,evS,kellyFrac,bankroll]);
+  const evData=useMemo(()=>{if(!simRes)return[];const smk={win:"sim_win",top_5:"sim_top5",top_10:"sim_top10",top_20:"sim_top20",make_cut:"sim_make_cut"};return simRes.map(p=>{const ev={};MARKETS.forEach(m=>{const od=p.playerOdds?.[m];if(od?.bestOdds>1){const imp=decToImp(od.bestOdds);const sp=p[smk[m]]||0;ev["ev_"+m]=sp-imp;ev["sim_"+m]=sp;ev["imp_"+m]=imp;ev["odds_"+m]=od.bestOdds;ev["kelly_"+m]=kellyBet(sp,od.bestOdds,kellyFrac,bankroll);}});return{...p,...ev};}).sort((a,b)=>{const av=a[evS.col]??-999,bv=b[evS.col]??-999;return evS.dir==="desc"?bv-av:av-bv;});},[simRes,evS,kellyFrac,bankroll]);
   const matchupRows=useMemo(()=>{if(!h2hData||!ds.matchupPairs?.length)return[];return ds.matchupPairs.slice(0,300).map(m=>{const s1=h2hData[m.id1+"_"+m.id2]??null,s2=s1!=null?1-s1:null;const i1=decToImp(m.dk1),i2=decToImp(m.dk2);const ev1=s1!=null&&i1>0?s1-i1:null,ev2=s2!=null&&i2>0?s2-i2:null;const k1=ev1>0&&m.dk1>1?kellyBet(s1,m.dk1,kellyFrac,bankroll):0;const k2=ev2>0&&m.dk2>1?kellyBet(s2,m.dk2,kellyFrac,bankroll):0;return{...m,s1,s2,i1,i2,ev1,ev2,k1,k2,bestEV:Math.max(ev1||0,ev2||0)};}).sort((a,b)=>b.bestEV-a.bestEV);},[h2hData,ds.matchupPairs,kellyFrac,bankroll]);
   const dSt={decomp:!!(findArr(ds.decomp)?.length),preds:!!(findArr(ds.preds)?.length),skills:!!(findArr(ds.skills)?.length),odds:Object.keys(ds.odds||{}).filter(k=>(findArr(ds.odds[k])||[]).length>0),matchups:ds.matchupPairs?.length||0};
   const hasOdds=dSt.odds.length>0;
   const tSort=(col,def="desc")=>setSort(s=>s.col===col?{...s,dir:s.dir==="desc"?"asc":"desc"}:{col,dir:def});
   const toggleCmp=(hid)=>setCompareItems(ci=>ci.includes(hid)?ci.filter(x=>x!==hid):ci.length>=2?[ci[1],hid]:[...ci,hid]);
-  const compareData=useMemo(()=>{if(compareItems.length<2)return null;const [a,b]=[hist.find(h=>h.id===compareItems[0]),hist.find(h=>h.id===compareItems[1])];if(!a||!b)return null;const bMap={};b.top30?.forEach(p=>bMap[p.id]=p);return{a,b,rows:(a.top30||[]).map(p=>{const bp=bMap[p.id]||{};return{name:p.n,aW:p.w,bW:bp.w||0,dW:(p.w||0)-(bp.w||0),aT5:p.t5||0,bT5:bp.t5||0,dT5:(p.t5||0)-(bp.t5||0)};}).sort((a,b)=>b.aW-a.aW)};},[compareItems,hist]);
-  const csvRes=()=>{if(!sorted.length)return;downloadCSV(sorted.map(p=>({Name:p.name,Win:pFmt(p.sim_win),Top5:pFmt(p.sim_top5),Top10:pFmt(p.sim_top10),Top20:pFmt(p.sim_top20),Cut:pFmt(p.sim_make_cut),AvgPos:p.avg_finish?.toFixed(1),DG_Win:pFmt(p.dg_win)})),"results.csv");};
-  const csvEV=()=>{if(!evData.length)return;downloadCSV(evData.filter(p=>MARKETS.some(m=>p["ev_"+m]!=null)).map(p=>({Name:p.name,...Object.fromEntries(MARKETS.flatMap(m=>[["EV_"+m,evFmt(p["ev_"+m])],["Sim_"+m,pFmt(p["sim_"+m])],["Odds_"+m,p["odds_"+m]?.toFixed(2)||""],["Kelly$_"+m,p["kelly_"+m]?.toFixed(2)||""]]))})),"ev_analysis.csv");};
+  const compareData=useMemo(()=>{if(compareItems.length<2)return null;const [a,b]=[hist.find(h=>h.id===compareItems[0]),hist.find(h=>h.id===compareItems[1])];if(!a||!b)return null;const bMap={};b.top30?.forEach(p=>bMap[p.id]=p);return{a,b,rows:(a.top30||[]).map(p=>{const bp=bMap[p.id]||{};return{name:p.n,aW:p.w,bW:bp.w||0,dW:(p.w||0)-(bp.w||0)};}).sort((a,b)=>b.aW-a.aW)};},[compareItems,hist]);
+  const csvRes=()=>{if(!sorted.length)return;downloadCSV(sorted.map(p=>({Name:p.name,Win:pFmt(p.sim_win),Top5:pFmt(p.sim_top5),Top10:pFmt(p.sim_top10),Top20:pFmt(p.sim_top20),Cut:pFmt(p.sim_make_cut),AvgPos:p.avg_finish?.toFixed(1)})),"results.csv");};
+  const csvEV=()=>{if(!evData.length)return;downloadCSV(evData.filter(p=>MARKETS.some(m=>p["ev_"+m]!=null)).map(p=>({Name:p.name,...Object.fromEntries(MARKETS.flatMap(m=>[["EV_"+m,evFmt(p["ev_"+m])],["Kelly$_"+m,p["kelly_"+m]?.toFixed(2)||""]]))})),"ev.csv");};
   const handleCSVUpload=(e)=>{const file=e.target.files?.[0];if(!file)return;const reader=new FileReader();reader.onload=(ev)=>{const data=parseCSV(ev.target.result);if(data.length>0){setCourseCSV(data);sSet("courseCSV",data);}};reader.readAsText(file);};
   const manualCourseSelect=()=>{if(!courseCSV||!courseMatchManual)return;const m=courseCSV.find(c=>c.course===courseMatchManual);if(m){setCourseMatch(m);const vecs=buildCourseVecs(courseCSV);setSimilarCourses(findSimilarCourses(m.course,vecs,10));}};
+  const fieldData=useMemo(()=>{if(!players.length)return[];const cats=["sg_dist","sg_acc","sg_app","sg_arg","sg_putt","sg_total","baseline","course_fit_adj","course_history_adj","similar_course_adj","recent_form_adj"];
+    const ranks={};cats.forEach(c=>{const sorted=[...players].sort((a,b)=>(b[c]||0)-(a[c]||0));const rm={};sorted.forEach((p,i)=>rm[p.id]=i+1);ranks[c]=rm;});
+    return players.map(p=>({...p,ranks})).sort((a,b)=>{const c=fieldSort.col;return fieldSort.dir==="desc"?(b[c]||0)-(a[c]||0):(a[c]||0)-(b[c]||0);});
+  },[players,fieldSort]);
+  const topFit=useMemo(()=>{if(!players.length)return new Set();return new Set([...players].sort((a,b)=>((b.course_fit_adj||0)+(b.course_history_adj||0))-((a.course_fit_adj||0)+(a.course_history_adj||0))).slice(0,10).map(p=>p.id));},[players]);
+  const topBasket=useMemo(()=>{if(!players.length)return new Set();const withBasket=[...players].filter(p=>(p.basket_rounds||0)>=MIN_BASKET_ROUNDS&&(p.similar_course_adj||0)!==0);if(!withBasket.length)return new Set();return new Set(withBasket.sort((a,b)=>(b.similar_course_adj||0)-(a.similar_course_adj||0)).slice(0,10).map(p=>p.id));},[players]);
 
-  /* ═══ RENDER ═══ */
+  const TABS=[["setup","⚙ Setup",true],["course","🏌 Course",true],["field","👥 Field",players.length>0],["simulation","⚖ Simulation",players.length>0],["results","📊 Results",!!simRes],["grading","📝 Grading",true]];
+  const RESULT_SUBS=[["sim_results","Results"],["ev","EV Analysis"],["matchups","Matchups"],["history","History"]];
+
   return(<div style={S.root}>
-    <div style={S.header}><div style={S.hL}><div style={S.logo}>◆</div><div><h1 style={S.title}>PGA Tournament Simulator <span style={{fontSize:9,color:"#22d3ee",background:"#164e63",padding:"1px 6px",borderRadius:3}}>v3</span></h1><div style={S.sub}>{tourney?tourney.name+" · "+tourney.course:"Course Intel · SG Weights · Kelly Criterion · Grading"}</div></div></div>
-      <div style={S.badges}>{players.length>0&&<span style={S.badge}>{players.length} players</span>}{simRes&&<span style={S.badge}>{simCount.toLocaleString()} sims</span>}{courseCSV&&<span style={{...S.badge,color:"#a78bfa",borderColor:"#7c3aed"}}>{courseCSV.length} courses</span>}{allScores&&<span style={{...S.badge,color:"#22d3ee",borderColor:"#0e7490"}}>H2H ready</span>}</div></div>
+    <div style={S.header}><div style={S.hL}><div style={S.logo}>◆</div><div><h1 style={S.title}>PGA Tournament Simulator <span style={{fontSize:9,color:"#22d3ee",background:"#164e63",padding:"1px 6px",borderRadius:3}}>v4.6</span></h1><div style={S.sub}>{tourney?tourney.name+" · "+tourney.course:"Course Intel · Field Analysis · Monte Carlo · Grading"}</div></div></div>
+      <div style={S.badges}>{players.length>0&&<span style={S.badge}>{players.length} players</span>}{simRes&&<span style={S.badge}>{simCount.toLocaleString()} sims</span>}{courseCSV&&<span style={{...S.badge,color:"#a78bfa",borderColor:"#7c3aed"}}>{courseCSV.length} courses</span>}</div></div>
+    <div style={S.tabs}>{TABS.map(([id,lb,en])=>(<button key={id} disabled={!en} onClick={()=>{setTab(id);if(id==="results")setSubTab("sim_results");}} style={{...S.tab,...(tab===id?S.tabOn:{}),...(!en?S.tabOff:{})}}>{lb}</button>))}</div>
+    {tab==="results"&&<div style={S.subTabs}>{RESULT_SUBS.map(([id,lb])=>(<button key={id} onClick={()=>setSubTab(id)} style={{...S.subTab,...(subTab===id?S.subTabOn:{})}}>{lb}</button>))}</div>}
+    {error&&tab==="setup"&&<div style={S.err}>⚠ {error}</div>}
 
-    <div style={S.tabs}>{[["setup","⚙","Setup",true],["course","🏌","Course",true],["weights","⚖","Weights",players.length>0],["simulate","▶","Simulate",players.length>0],["results","📊","Results",!!simRes],["ev","💰","EV",!!simRes],["matchups","⚔","Matchups",!!simRes&&(ds.matchupPairs?.length>0)],["grading","📝","Grading",true],["history","🕐","History",true]].map(([id,ic,lb,en])=>(<button key={id} disabled={!en} onClick={()=>setTab(id)} style={{...S.tab,...(tab===id?S.tabOn:{}),...(!en?S.tabOff:{})}}>{ic} {lb}</button>))}</div>
-    {error&&<div style={S.err}>⚠ {error}</div>}
-
-    {/* SETUP */}
+    {/* ═══ SETUP ═══ */}
     {tab==="setup"&&<div style={S.panel}>
       <h2 style={S.h2}>API Configuration</h2>
       <div style={S.row}><input type="password" value={apiKeyInp} onChange={e=>setApiKeyInp(e.target.value)} placeholder="DataGolf API key..." style={S.inp}/><button onClick={saveKey} style={S.btnP}>Save Key</button></div>
-      {apiKey&&<div style={S.ok}>✓ Key saved</div>}
+      {apiKey&&<div style={S.ok}>✓ DataGolf key saved</div>}
       <button onClick={()=>fetchAll(0)} disabled={!apiKey||loading} style={{...S.btnBig,marginTop:14,opacity:(!apiKey||loading)?0.5:1}}>{loading?"⏳ "+fetchSt:"🔄 Fetch Current Tournament Data"}</button>
       <div style={{...S.dv,margin:"22px 0 14px"}}/>
       <h2 style={S.h2}>Data Import Dashboard</h2>
       <div style={{display:"flex",flexDirection:"column",gap:5}}>
-        {[{key:"decomp",label:"Player Decompositions",req:true,on:dSt.decomp,desc:"baseline_pred, driving adjustments, approach, short game, putting, course history, fit, form",path:"/preds/player-decompositions?tour=pga"},{key:"preds",label:"Pre-Tournament Predictions",on:dSt.preds,desc:"DG model win/top5/top10/top20/make_cut",path:"/preds/pre-tournament?tour=pga&odds_format=percent"},{key:"skills",label:"Skill Ratings",on:dSt.skills,desc:"Overall SG ratings per category",path:"/preds/skill-ratings?display=value"},{key:"odds_win",label:"Odds — Win",on:dSt.odds.includes("win"),desc:"DraftKings outright win odds",path:"/betting-tools/outrights?tour=pga&market=win&odds_format=decimal"},{key:"odds_t5",label:"Odds — Top 5",on:dSt.odds.includes("top_5"),desc:"DraftKings Top 5",path:"/betting-tools/outrights?tour=pga&market=top_5&odds_format=decimal"},{key:"odds_t10",label:"Odds — Top 10",on:dSt.odds.includes("top_10"),desc:"DraftKings Top 10",path:"/betting-tools/outrights?tour=pga&market=top_10&odds_format=decimal"},{key:"odds_t20",label:"Odds — Top 20",on:dSt.odds.includes("top_20"),desc:"DraftKings Top 20",path:"/betting-tools/outrights?tour=pga&market=top_20&odds_format=decimal"},{key:"matchups",label:"Matchups ("+dSt.matchups+")",on:dSt.matchups>0,desc:"72-hole H2H pairs",path:"/betting-tools/matchups?tour=pga&market=tournament_matchups&odds_format=decimal"}].map(d=>(<div key={d.key} style={{...S.stRow,borderLeft:"3px solid "+(d.on?"#22c55e":d.req?"#f59e0b":"#334155")}}><div style={{flex:1}}><span style={{color:d.on?"#22c55e":"#64748b",fontWeight:600,fontSize:12}}>{d.on?"✓":"○"} {d.label}{d.req&&!d.on&&<span style={{color:"#f59e0b",fontSize:9,marginLeft:5}}>REQUIRED</span>}</span><div style={{fontSize:10,color:"#475569",marginTop:1}}>{d.desc}</div></div>{apiKey&&!d.on&&<button onClick={()=>window.open(DG_BASE+d.path+"&file_format=json&key="+apiKey,"_blank")} style={S.btnSm}>Open ↗</button>}</div>))}
+        {[{key:"decomp",label:"Player Decompositions",req:true,on:dSt.decomp,path:"/preds/player-decompositions?tour=pga"},{key:"preds",label:"Pre-Tournament Predictions",on:dSt.preds,path:"/preds/pre-tournament?tour=pga&odds_format=percent"},{key:"skills",label:"Skill Ratings",on:dSt.skills,path:"/preds/skill-ratings?display=value"},{key:"odds_win",label:"Odds — Win",on:dSt.odds.includes("win"),path:"/betting-tools/outrights?tour=pga&market=win&odds_format=decimal"},{key:"odds_t5",label:"Odds — Top 5",on:dSt.odds.includes("top_5"),path:"/betting-tools/outrights?tour=pga&market=top_5&odds_format=decimal"},{key:"odds_t10",label:"Odds — Top 10",on:dSt.odds.includes("top_10"),path:"/betting-tools/outrights?tour=pga&market=top_10&odds_format=decimal"},{key:"odds_t20",label:"Odds — Top 20",on:dSt.odds.includes("top_20"),path:"/betting-tools/outrights?tour=pga&market=top_20&odds_format=decimal"},{key:"matchups",label:"Matchups ("+dSt.matchups+")",on:dSt.matchups>0,path:"/betting-tools/matchups?tour=pga&market=tournament_matchups&odds_format=decimal"}].map(d=>(<div key={d.key} style={{...S.stRow,borderLeft:"3px solid "+(d.on?"#22c55e":d.req?"#f59e0b":"#334155")}}><div style={{flex:1}}><span style={{color:d.on?"#22c55e":"#64748b",fontWeight:600,fontSize:12}}>{d.on?"✓":"○"} {d.label}</span></div>{apiKey&&!d.on&&<button onClick={()=>window.open(DG_BASE+d.path+"&file_format=json&key="+apiKey,"_blank")} style={S.btnSm}>Open ↗</button>}</div>))}
       </div>
-      {/* Event List for Course/Grading dropdowns */}
-      <div style={{marginTop:8,...S.stRow,borderLeft:"3px solid "+(eventList?"#22c55e":"#334155")}}>
-        <div style={{flex:1}}><span style={{color:eventList?"#22c55e":"#64748b",fontWeight:600,fontSize:12}}>{eventList?"✓":"○"} Historical Event List{eventList?" ("+eventList.length+")":""}</span><div style={{fontSize:10,color:"#475569",marginTop:1}}>Tournament names & IDs for Course and Grading tab dropdowns — load once, cached permanently</div></div>
-        <div style={{display:"flex",gap:4}}>
-          {!eventList&&<button onClick={fetchEventList} disabled={eventListLoading} style={S.btnSm}>{eventListLoading?"⏳ Trying...":"Load"}</button>}
-          {!eventList&&<button onClick={()=>window.open(eventListUrl,"_blank")} style={S.btnSm}>Open ↗</button>}
-        </div>
-      </div>
-      {!eventList&&eventListError&&<div style={{fontSize:10,color:"#fca5a5",marginTop:4}}>{eventListError}</div>}
-      <div style={{marginTop:14}}><PasteBox onImport={(text)=>{
-        try{const raw=JSON.parse(text.trim());const arr=findArr(raw);
-          if(arr?.length&&arr[0].event_id!==undefined&&arr[0].calendar_year!==undefined){
-            const sorted=arr.sort((a,b)=>(b.calendar_year||0)-(a.calendar_year||0));setEventList(sorted);sSet("eventList",sorted);setEventListError("");
-            return{ok:true,msg:"✓ Event List ("+sorted.length+" events)"};
-          }
-        }catch{}
-        return handleImport(text);
-      }}/></div>
+      <div style={{marginTop:8,...S.stRow,borderLeft:"3px solid "+(eventList?"#22c55e":"#334155")}}><div style={{flex:1}}><span style={{color:eventList?"#22c55e":"#64748b",fontWeight:600,fontSize:12}}>{eventList?"✓":"○"} Historical Event List{eventList?" ("+eventList.length+")":""}</span><div style={{fontSize:10,color:"#475569",marginTop:1}}>For Course & Grading — load once</div></div><div style={{display:"flex",gap:4}}>{!eventList&&<button onClick={fetchEventList} disabled={eventListLoading} style={S.btnSm}>{eventListLoading?"⏳":"Load"}</button>}{!eventList&&<button onClick={()=>window.open(eventListUrl,"_blank")} style={S.btnSm}>Open ↗</button>}</div></div>
+      {eventListError&&<div style={{fontSize:10,color:"#fca5a5",marginTop:4}}>{eventListError}</div>}
+      <div style={{marginTop:8,...S.stRow,borderLeft:"3px solid "+(courseCSV?"#22c55e":"#334155")}}><div style={{flex:1}}><span style={{color:courseCSV?"#22c55e":"#64748b",fontWeight:600,fontSize:12}}>{courseCSV?"✓":"○"} Course Characteristics CSV{courseCSV?" ("+courseCSV.length+" courses)":""}</span></div><input type="file" accept=".csv" onChange={handleCSVUpload} style={{fontSize:10,color:"#94a3b8",maxWidth:200}}/></div>
+      <div style={{marginTop:14}}><PasteBox onImport={handleImport}/></div>
       {players.length>0&&<div style={S.loadBar}><span>✓ {players.length} players loaded</span><button onClick={()=>setTab("course")} style={S.btnP}>Course →</button></div>}
     </div>}
 
-    {/* COURSE */}
+    {/* ═══ COURSE ═══ */}
     {tab==="course"&&<div style={S.panel}>
-      <h2 style={S.h2}>Course Intelligence</h2><p style={S.help}>Upload CSV, analyze course profile, weather, and get data-driven weight suggestions.</p>
-      <div style={S.section}><h3 style={S.h3}>📊 Course Database</h3><div style={{display:"flex",gap:8,alignItems:"center"}}><input type="file" accept=".csv" onChange={handleCSVUpload} style={{fontSize:11,color:"#94a3b8"}}/>{courseCSV&&<span style={{fontSize:11,color:"#22c55e"}}>✓ {courseCSV.length} courses</span>}</div></div>
-
+      <h2 style={S.h2}>Course Intelligence</h2>
       {courseCSV&&<div style={S.section}><h3 style={S.h3}>🎯 Course Match</h3>
-        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:8}}><select value={courseMatchManual} onChange={e=>setCourseMatchManual(e.target.value)} style={{...S.inp,maxWidth:400}}><option value="">Select course...</option>{courseCSV.map(c=><option key={c.course} value={c.course}>{c.course}</option>)}</select><button onClick={manualCourseSelect} style={S.btnSm}>Match</button>{tourney?.course&&<span style={{fontSize:10,color:"#64748b"}}>Auto: {tourney.course}</span>}</div>
+        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:8}}><select value={courseMatchManual} onChange={e=>setCourseMatchManual(e.target.value)} style={{...S.inp,maxWidth:400}}><option value="">Select course...</option>{courseCSV.map(c=><option key={c.course} value={c.course}>{c.course}</option>)}</select><button onClick={manualCourseSelect} style={S.btnSm}>Match</button></div>
         {courseMatch&&<div style={{padding:12,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:14,fontWeight:700,color:"#22d3ee",marginBottom:8}}>{courseMatch.course}</div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(120px,1fr))",gap:8}}>{[["Par",courseMatch.par],["Yardage",courseMatch.yardage],["Adj Score",courseMatch.adj_score_to_par?.toFixed(2)],["Drv Dist",courseMatch.adj_driving_distance?.toFixed(1)],["Drv Acc",typeof courseMatch.adj_driving_accuracy==="number"?(courseMatch.adj_driving_accuracy*100).toFixed(1)+"%":"-"],["FW Width",courseMatch.fw_width?.toFixed(1)],["GIR",typeof courseMatch.adj_gir==="number"?(courseMatch.adj_gir*100).toFixed(1)+"%":"-"],["SG Putt",courseMatch.putt_sg?.toFixed(3)],["SG App",courseMatch.app_sg?.toFixed(3)],["SG OTT",courseMatch.ott_sg?.toFixed(3)],["SG ARG",courseMatch.arg_sg?.toFixed(3)],["Penalties",courseMatch.adj_penalties?.toFixed(2)]].map(([l,v])=>(<div key={l}><div style={{fontSize:8,color:"#64748b",textTransform:"uppercase"}}>{l}</div><div style={{fontSize:13,fontWeight:700,color:"#e2e8f0"}}>{v??"-"}</div></div>))}</div>
-        </div>}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(110px,1fr))",gap:8}}>{[["Par",courseMatch.par],["Yards",courseMatch.yardage],["Adj Score",courseMatch.adj_score_to_par?.toFixed(2)],["FW Width",courseMatch.fw_width?.toFixed(1)],["SG Putt",courseMatch.putt_sg?.toFixed(3)],["SG App",courseMatch.app_sg?.toFixed(3)],["SG OTT",courseMatch.ott_sg?.toFixed(3)],["SG ARG",courseMatch.arg_sg?.toFixed(3)]].map(([l,v])=>(<div key={l}><div style={{fontSize:8,color:"#64748b",textTransform:"uppercase"}}>{l}</div><div style={{fontSize:13,fontWeight:700,color:"#e2e8f0"}}>{v??"-"}</div></div>))}</div></div>}
       </div>}
-
+      {/* Course Characteristic Radar from CSV */}
+      {courseRadarData&&<div style={S.section}><h3 style={S.h3}>📈 Course SG Profile</h3>
+        <CourseRadar data={courseRadarData} courseName={courseMatch?.course||"Course"}/>
+      </div>}
       {similarCourses.length>0&&<div style={S.section}><h3 style={S.h3}>🔗 Top 10 Similar Courses</h3>
-        <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Course</th><th style={S.th}>Similarity</th><th style={S.th}>Par</th><th style={S.th}>Yards</th><th style={S.th}>Adj Score</th><th style={S.th}>FW Width</th><th style={S.th}>SG Putt</th><th style={S.th}>SG App</th><th style={S.th}>SG OTT</th></tr></thead><tbody>
-          {similarCourses.map((c,i)=>(<tr key={c.course} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{c.course}</td><td style={{...S.td,fontWeight:700,color:c.sim>0.95?"#22c55e":c.sim>0.9?"#22d3ee":"#94a3b8"}}>{(c.sim*100).toFixed(1)}%</td><td style={S.td}>{c.data.par}</td><td style={S.td}>{c.data.yardage}</td><td style={S.td}>{c.data.adj_score_to_par?.toFixed(2)}</td><td style={S.td}>{c.data.fw_width?.toFixed(1)}</td><td style={S.td}>{c.data.putt_sg?.toFixed(3)}</td><td style={S.td}>{c.data.app_sg?.toFixed(3)}</td><td style={S.td}>{c.data.ott_sg?.toFixed(3)}</td></tr>))}
+        <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Course</th><th style={S.th}>Sim%</th><th style={S.th}>Par</th><th style={S.th}>Yards</th><th style={S.th}>SG Putt</th><th style={S.th}>SG App</th><th style={S.th}>SG OTT</th></tr></thead><tbody>
+          {similarCourses.map((c,i)=>(<tr key={c.course} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{c.course}</td><td style={{...S.td,fontWeight:700,color:c.sim>0.95?"#22c55e":"#22d3ee"}}>{(c.sim*100).toFixed(1)}%</td><td style={S.td}>{c.data.par}</td><td style={S.td}>{c.data.yardage}</td><td style={S.td}>{c.data.putt_sg?.toFixed(3)}</td><td style={S.td}>{c.data.app_sg?.toFixed(3)}</td><td style={S.td}>{c.data.ott_sg?.toFixed(3)}</td></tr>))}
         </tbody></table></div></div>}
-
-      {courseCSV&&<div style={S.section}><h3 style={S.h3}>📈 Historical Course Profile</h3><p style={{fontSize:10,color:"#64748b",marginBottom:8}}>Fetch historical rounds to see which SG categories correlate with good finishes.</p>
-        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}>
-          {!eventList&&<span style={{fontSize:11,color:"#f59e0b"}}>⚠ Load Historical Event List on the Setup tab first</span>}
-          {eventList&&<select value={courseHistEventId?courseHistEventId+"|"+courseHistYear:""} onChange={e=>handleCourseEventSelect(e.target.value)} style={{...S.inp,maxWidth:400}}>
-            <option value="">Select tournament...</option>
-            {eventList.map((ev,i)=><option key={i} value={(ev.event_id||"")+"|"+(ev.calendar_year||"")}>{ev.event_name||ev.event_id} — {ev.calendar_year}{ev.course?" · "+ev.course:""}</option>)}
-          </select>}
-          {eventList&&<button onClick={fetchCourseHist} disabled={courseHistLoading||!courseHistEventId} style={{...S.btnP,opacity:courseHistLoading||!courseHistEventId?0.5:1}}>{courseHistLoading?"⏳ Loading...":"Fetch Historical Data"}</button>}
+      {/* Historical Weights Fetch */}
+      {courseCSV&&<div style={S.section}><h3 style={S.h3}>📊 Historical Weight Analysis</h3>
+        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:10,flexWrap:"wrap"}}>
+          {!eventList&&<span style={{fontSize:11,color:"#f59e0b"}}>⚠ Load Event List on Setup tab</span>}
+          {eventList&&<select value={courseHistEventId?courseHistEventId+"|"+courseHistYear:""} onChange={e=>handleEventSelect(e.target.value,setCourseHistEventId,setCourseHistYear)} style={{...S.inp,maxWidth:400}}><option value="">Select tournament...</option>{eventList.map((ev,i)=><option key={i} value={(ev.event_id||"")+"|"+(ev.calendar_year||"")}>{ev.event_name||ev.event_id} — {ev.calendar_year}</option>)}</select>}
+          {eventList&&<button onClick={fetchCourseHist} disabled={courseHistLoading||!courseHistEventId} style={{...S.btnP,opacity:courseHistLoading||!courseHistEventId?0.5:1}}>{courseHistLoading?"⏳ Loading...":"Analyze Course"}</button>}
         </div>
         {courseHistStatus&&<div style={{fontSize:11,color:courseHistStatus.startsWith("✓")?"#22c55e":"#94a3b8",marginBottom:10}}>{courseHistStatus}</div>}
-        {(courseCorr||simCourseCorr)&&<div style={{display:"grid",gridTemplateColumns:courseCorr&&simCourseCorr?"1fr 1fr":"1fr",gap:18}}>
-          {courseCorr&&<div style={{padding:14,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:12,fontWeight:700,color:"#22d3ee",marginBottom:4}}>This Course</div><div style={{fontSize:9,color:"#64748b",marginBottom:10}}>{courseCorr.n} player-events · {courseCorr.rounds} rounds · Years: {courseCorr.years?.join(", ")}</div><div style={{fontSize:9,color:"#64748b",marginBottom:6}}>Correlation to finish (negative = good finishes)</div>{courseCorr.corrs.map(c=><CorrBar key={c.k} val={c.corr} label={c.l}/>)}</div>}
-          {simCourseCorr&&<div style={{padding:14,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:12,fontWeight:700,color:"#a78bfa",marginBottom:4}}>Similar Courses</div><div style={{fontSize:9,color:"#64748b",marginBottom:10}}>{simCourseCorr.n} player-events · {simCourseCorr.rounds} rounds</div><div style={{fontSize:9,color:"#64748b",marginBottom:6}}>Correlation to finish (negative = good finishes)</div>{simCourseCorr.corrs.map(c=><CorrBar key={c.k} val={c.corr} label={c.l} color="#a78bfa"/>)}</div>}
-        </div>}
       </div>}
-
-      {players.length>0&&<div style={S.section}><h3 style={S.h3}>🎯 DataGolf Fit Benchmark — Top 15</h3>
-        <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player</th><th style={S.th}>Course Fit</th><th style={S.th}>Course History</th><th style={S.th}>Combined</th>{playerSimCoursePerf&&<th style={{...S.th,color:"#a78bfa"}}>Sim Course SG</th>}</tr></thead><tbody>
-          {[...players].sort((a,b)=>((b.course_fit_adj||0)+(b.course_history_adj||0))-((a.course_fit_adj||0)+(a.course_history_adj||0))).slice(0,15).map((p,i)=>{const perf=playerSimCoursePerf?.[p.id]||playerSimCoursePerf?.[p.name];return<tr key={p.id} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{p.name}</td><td style={{...S.td,color:(p.course_fit_adj||0)>0?"#22c55e":"#ef4444"}}>{(p.course_fit_adj||0)>0?"+":""}{(p.course_fit_adj||0).toFixed(3)}</td><td style={{...S.td,color:(p.course_history_adj||0)>0?"#22c55e":"#ef4444"}}>{(p.course_history_adj||0)>0?"+":""}{(p.course_history_adj||0).toFixed(3)}</td><td style={{...S.td,fontWeight:700,color:((p.course_fit_adj||0)+(p.course_history_adj||0))>0?"#22c55e":"#ef4444"}}>{((p.course_fit_adj||0)+(p.course_history_adj||0))>0?"+":""}{((p.course_fit_adj||0)+(p.course_history_adj||0)).toFixed(3)}</td>{playerSimCoursePerf&&<td style={{...S.td,color:perf?.sg_total>0?"#a78bfa":"#64748b"}}>{perf?(perf.sg_total>0?"+":"")+perf.sg_total.toFixed(3)+" ("+perf.rounds+"r)":"-"}</td>}</tr>;})}
+      {/* Course Fit — DG + AV Basket */}
+      {players.length>0&&<div style={S.section}><h3 style={S.h3}>🎯 Course Fit — Top 15</h3>
+        <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player</th><th style={S.th}>DG Fit</th><th style={S.th}>DG Hx</th><th style={{...S.th,color:"#f59e0b"}}>AV Basket</th><th style={{...S.th,color:"#f59e0b",fontSize:7}}>Rnds</th><th style={S.th}>Combined</th></tr></thead><tbody>
+          {[...players].sort((a,b)=>((b.course_fit_adj||0)+(b.course_history_adj||0)+(b.similar_course_adj||0))-((a.course_fit_adj||0)+(a.course_history_adj||0)+(a.similar_course_adj||0))).slice(0,15).map((p,i)=>{const bk=p.similar_course_adj||0;const br=p.basket_rounds||0;const hasBk=br>=MIN_BASKET_ROUNDS;const combined=(p.course_fit_adj||0)+(p.course_history_adj||0)+bk;return<tr key={p.id} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{topFit.has(p.id)?"🎯 ":""}{topBasket.has(p.id)?"🔶 ":""}{p.name}</td><td style={{...S.td,color:(p.course_fit_adj||0)>0?"#22c55e":"#ef4444"}}>{(p.course_fit_adj||0)>0?"+":""}{(p.course_fit_adj||0).toFixed(3)}</td><td style={{...S.td,color:(p.course_history_adj||0)>0?"#22c55e":"#ef4444"}}>{(p.course_history_adj||0)>0?"+":""}{(p.course_history_adj||0).toFixed(3)}</td><td style={{...S.td,color:hasBk?(bk>0?"#f59e0b":"#ef4444"):"#334155"}}>{hasBk?(bk>0?"+":"")+bk.toFixed(3):"—"}</td><td style={{...S.td,color:"#475569",fontSize:9}}>{br>0?br+"r":""}</td><td style={{...S.td,fontWeight:700}}>{combined>0?"+":""}{combined.toFixed(3)}</td></tr>;})}
         </tbody></table></div></div>}
-
-      {fieldComp&&<div style={S.section}><h3 style={S.h3}>📊 Field Composition</h3><p style={{fontSize:10,color:"#64748b",marginBottom:8}}>Where separation lies. Higher spread = more differentiation.</p>
-        {fieldComp.sort((a,b)=>b.spread-a.spread).map(c=>(<div key={c.k} style={{marginBottom:10,padding:"8px 12px",background:"#0f172a",borderRadius:5}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><span style={{fontSize:11,fontWeight:600,color:"#e2e8f0"}}>{c.l}</span><span style={{fontSize:10,color:"#22d3ee"}}>Spread: {c.spread.toFixed(3)} · Std: {c.std.toFixed(3)}</span></div><div style={{display:"flex",gap:12,fontSize:9,color:"#64748b"}}><span>Avg: {c.avg.toFixed(3)}</span><span>Min: {c.min.toFixed(3)}</span><span>Max: {c.max.toFixed(3)}</span></div></div>))}</div>}
-
-      <div style={S.section}><h3 style={S.h3}>🌤 Weather Forecast</h3><div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10,flexWrap:"wrap"}}><input value={weatherCity} onChange={e=>setWeatherCity(e.target.value)} placeholder={tourney?.city||tourney?.course||"Enter city (e.g., Tampa, FL)"} style={{...S.inp,maxWidth:250}}/><button onClick={fetchWeather} disabled={weatherLoading} style={{...S.btnSm,opacity:weatherLoading?0.5:1}}>{weatherLoading?"Loading...":"Fetch Weather"}</button></div>
+      {/* Weather */}
+      <div style={S.section}><h3 style={S.h3}>🌤 Weather</h3><div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10}}><input value={weatherCity} onChange={e=>setWeatherCity(e.target.value)} placeholder={tourney?.city||"Enter city..."} style={{...S.inp,maxWidth:250}}/><button onClick={fetchWeather} disabled={weatherLoading} style={S.btnSm}>{weatherLoading?"...":"Fetch"}</button></div>
         {weatherData?.error&&<div style={{fontSize:11,color:"#fca5a5"}}>{weatherData.error}</div>}
-        {weatherData?.forecast&&<div><div style={{fontSize:11,color:"#94a3b8",marginBottom:8}}>{weatherData.location?.name}, {weatherData.location?.region}</div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:8}}>{weatherData.forecast.forecastday.map(d=>{const windy=d.day.maxwind_mph>=15,rainy=d.day.daily_chance_of_rain>=40;return<div key={d.date} style={{padding:10,background:"#0f172a",borderRadius:6,border:"1px solid "+(windy||rainy?"#f59e0b":"#1e293b")}}><div style={{fontSize:10,fontWeight:700,color:"#cbd5e1"}}>{new Date(d.date+"T12:00").toLocaleDateString("en",{weekday:"short",month:"short",day:"numeric"})}</div><div style={{fontSize:18,fontWeight:700,color:"#e2e8f0",margin:"4px 0"}}>{d.day.maxtemp_f?.toFixed(0)}°F</div><div style={{fontSize:9,color:"#64748b"}}>{d.day.condition?.text}</div><div style={{fontSize:9,color:windy?"#f59e0b":"#64748b",marginTop:3}}>💨 {d.day.maxwind_mph} mph</div><div style={{fontSize:9,color:rainy?"#f59e0b":"#64748b"}}>🌧 {d.day.daily_chance_of_rain}%</div>{(windy||rainy)&&<div style={{fontSize:8,color:"#f59e0b",marginTop:4,padding:"2px 4px",background:"#1a1a0e",borderRadius:3}}>{windy?"↑ Drv Acc":""}{windy&&rainy?" · ":""}{rainy?"↑ ARG/Putt":""}</div>}</div>;})}</div></div>}
+        {weatherData?.forecast&&<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:8}}>{weatherData.forecast.forecastday.map(d=>{const windy=d.day.maxwind_mph>=15,rainy=d.day.daily_chance_of_rain>=40;return<div key={d.date} style={{padding:10,background:"#0f172a",borderRadius:6,border:"1px solid "+(windy||rainy?"#f59e0b":"#1e293b")}}><div style={{fontSize:10,fontWeight:700,color:"#cbd5e1"}}>{new Date(d.date+"T12:00").toLocaleDateString("en",{weekday:"short",month:"short",day:"numeric"})}</div><div style={{fontSize:18,fontWeight:700,color:"#e2e8f0"}}>{d.day.maxtemp_f?.toFixed(0)}°F</div><div style={{fontSize:9,color:"#64748b"}}>{d.day.condition?.text}</div><div style={{fontSize:9,color:windy?"#f59e0b":"#64748b"}}>💨 {d.day.maxwind_mph}mph</div><div style={{fontSize:9,color:rainy?"#f59e0b":"#64748b"}}>🌧 {d.day.daily_chance_of_rain}%</div></div>;})}</div>}
+        {weatherInsights&&<div style={{marginTop:12}}>{weatherInsights.tips.map((t,i)=>(<div key={i} style={{padding:"8px 12px",marginBottom:6,background:"#0f172a",borderRadius:5,borderLeft:"3px solid #f59e0b",fontSize:11,color:"#e2e8f0"}}><span style={{marginRight:6}}>{t.icon}</span>{t.text}</div>))}</div>}
       </div>
     </div>}
 
-    {/* WEIGHTS */}
-    {tab==="weights"&&<div style={S.panel}><div style={{display:"grid",gridTemplateColumns:"1fr 250px",gap:18}}><div>
-      <h2 style={S.h2}>Strokes Gained Weights <span style={{fontSize:10,color:"#64748b",fontWeight:400}}>(sum to 100%)</span></h2>
-      <div style={{fontSize:10,color:"#94a3b8",marginBottom:12,padding:"7px 11px",background:"#0f172a",borderRadius:4,borderLeft:"3px solid #22d3ee"}}>SENSITIVITY ×{SENSITIVITY}: delta amplified {SENSITIVITY}×</div>
-      {[{k:"dist",l:"SG: Driving Distance",d:"driving_distance_adjustment"},{k:"acc",l:"SG: Driving Accuracy",d:"driving_accuracy_adjustment"},{k:"app",l:"SG: Approach",d:"cf_approach_comp"},{k:"arg",l:"SG: Around the Green",d:"cf_short_comp"},{k:"putt",l:"SG: Putting",d:"putting_adjustment"}].map(s=>(<div key={s.k} style={S.slG}><div style={S.slH}><span style={S.slL}>{s.l}</span><span style={S.slV}>{sgW[s.k]}%</span></div><div style={{fontSize:10,color:"#64748b",marginBottom:3}}>{s.d}</div><input type="range" min={0} max={100} value={sgW[s.k]} onChange={e=>adjSG(s.k,+e.target.value)} style={S.slider}/></div>))}
-      <div style={{padding:"8px 12px",background:"#0f172a",borderRadius:5,marginTop:4,fontSize:11,color:"#94a3b8"}}>Total: <b style={{color:Object.values(sgW).reduce((a,b)=>a+b,0)===100?"#22c55e":"#ef4444"}}>{Object.values(sgW).reduce((a,b)=>a+b,0)}%</b></div>
-      <div style={{...S.dv,margin:"20px 0"}}/>
-      <h2 style={S.h2}>Contextual Multipliers <span style={{fontSize:10,color:"#64748b",fontWeight:400}}>(0%=off 100%=full 200%=doubled)</span></h2>
-      {[{k:"ch",l:"Course History",d:"course_history_adjustment"},{k:"cf",l:"Course Fit",d:"total_fit_adjustment"},{k:"rf",l:"Recent Form",d:"true_sg_adjustments"},{k:"sc",l:"Similar Course Performance",d:"Per-round SG at similar courses (from Course tab)",color:"#a78bfa"}].map(s=>(<div key={s.k} style={S.slG}><div style={S.slH}><span style={{...S.slL,color:s.color||"#e2e8f0"}}>{s.l}</span><span style={{...S.slV,color:s.color||"#22d3ee"}}>{ctxW[s.k]}%</span></div><div style={{fontSize:10,color:"#64748b",marginBottom:3}}>{s.d}</div><input type="range" min={0} max={200} value={ctxW[s.k]} onChange={e=>setCtxW(w=>({...w,[s.k]:+e.target.value}))} style={S.slider}/></div>))}
-    </div><div style={S.side}><h3 style={S.h3}>Saved Presets</h3><div style={{display:"flex",gap:4,marginBottom:8}}><input value={pName} onChange={e=>setPName(e.target.value)} placeholder="Name..." style={{...S.inp,fontSize:11,padding:"5px 8px"}}/><button onClick={savePre} disabled={!pName.trim()} style={{...S.btnSm,opacity:pName.trim()?1:0.4}}>Save</button></div>
-      {presets.map(p=>(<div key={p.name} style={{display:"flex",gap:3,marginBottom:3}}><button onClick={()=>{setSgW(p.sg);setCtxW(prev=>({...prev,...p.cx}));}} style={S.preBtn}>{p.name}</button><button onClick={()=>{const u=presets.filter(x=>x.name!==p.name);setPresets(u);sSet("presets",u);}} style={S.preDel}>✕</button></div>))}{!presets.length&&<div style={S.empty}>No presets</div>}
-      <div style={{...S.dv,margin:"12px 0"}}/><h3 style={S.h3}>Quick Profiles</h3>
-      {[{n:"Balanced",sg:{dist:20,acc:10,app:30,arg:20,putt:20},cx:{ch:100,cf:100,rf:100,sc:100}},{n:"Ball Striker",sg:{dist:20,acc:10,app:40,arg:15,putt:15},cx:{ch:100,cf:120,rf:100,sc:100}},{n:"Distance",sg:{dist:35,acc:5,app:25,arg:20,putt:15},cx:{ch:100,cf:130,rf:100,sc:100}},{n:"Scrambler",sg:{dist:5,acc:10,app:20,arg:35,putt:30},cx:{ch:100,cf:100,rf:100,sc:100}},{n:"Putting Guru",sg:{dist:10,acc:10,app:25,arg:20,putt:35},cx:{ch:100,cf:80,rf:100,sc:100}},{n:"Course Horse",sg:{dist:20,acc:10,app:30,arg:20,putt:20},cx:{ch:180,cf:150,rf:80,sc:150}},{n:"Hot Hand",sg:{dist:20,acc:10,app:30,arg:20,putt:20},cx:{ch:60,cf:60,rf:180,sc:60}}].map(q=>(<button key={q.n} onClick={()=>{setSgW(q.sg);setCtxW(q.cx);}} style={S.qpBtn}>{q.n}</button>))}
-    </div></div></div>}
-
-    {/* SIMULATE */}
-    {tab==="simulate"&&<div style={S.panel}><h2 style={S.h2}>Run Simulation</h2>
-      <div style={{fontSize:10,color:"#64748b",marginBottom:12,padding:"6px 10px",background:"#0f172a",borderRadius:4,borderLeft:"3px solid "+(simCount<=MAX_STORE?"#22c55e":"#f59e0b")}}>H2H: {simCount<=MAX_STORE?"✓ Stored":"✗ Too many sims"}</div>
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:18,marginBottom:18}}><div><label style={S.label}>Iterations</label><div style={{display:"flex",gap:5,flexWrap:"wrap"}}>{SIM_COUNTS.map(c=>(<button key={c} onClick={()=>setSimCount_(c)} style={{...S.simBtn,...(simCount===c?S.simBtnOn:{})}}>{c.toLocaleString()}</button>))}</div></div>
-        <div style={S.cfgBox}><h3 style={S.h3}>Config</h3><div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:5}}>{[["Players",players.length],["Sims",simCount.toLocaleString()],["Dist",sgW.dist+"%"],["Acc",sgW.acc+"%"],["App",sgW.app+"%"],["ARG",sgW.arg+"%"],["Putt",sgW.putt+"%"],["Hx",ctxW.ch+"%"],["Fit",ctxW.cf+"%"],["Form",ctxW.rf+"%"],["SimC",ctxW.sc+"%"]].map(([l,v])=>(<div key={l}><div style={{fontSize:8,color:"#64748b",textTransform:"uppercase"}}>{l}</div><div style={{fontSize:12,fontWeight:700,color:"#e2e8f0"}}>{v}</div></div>))}</div></div></div>
-      <button onClick={doSim} disabled={simRunning||!players.length} style={{...S.btnRun,opacity:(simRunning||!players.length)?0.6:1}}>{simRunning?"⏳ Running...":"▶ Run "+simCount.toLocaleString()+" Simulations"}</button>
+    {/* ═══ FIELD ═══ */}
+    {tab==="field"&&<div style={S.panel}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+        <div><h2 style={S.h2}>Field Analysis</h2><p style={{fontSize:10,color:"#64748b"}}>Rankings within this field.{topFit.size>0?" 🎯 = DG Top 10 Fit.":""}{topBasket.size>0?" 🔶 = AV Basket Top 10.":""}</p></div>
+        <div style={{display:"flex",gap:4}}>{["value","rank"].map(m=>(<button key={m} onClick={()=>setFieldMode(m)} style={{...S.simBtn,...(fieldMode===m?S.simBtnOn:{})}}>{m==="value"?"Values":"Ranks"}</button>))}</div>
+      </div>
+      <div style={S.tW}><table style={S.table}><thead><tr>
+        <th style={S.th}>#</th><th style={{...S.th,textAlign:"left",cursor:"pointer"}} onClick={()=>setFieldSort(s=>({col:"name",dir:s.dir==="asc"?"desc":"asc"}))}>Player</th>
+        {[["sg_dist","Drv Dist"],["sg_acc","Drv Acc"],["sg_app","Approach"],["sg_arg","ARG"],["sg_putt","Putting"],["sg_total","Total SG"],["baseline","Baseline"],["course_fit_adj","DG Fit"],["course_history_adj","Hx"],["similar_course_adj","Basket"],["recent_form_adj","Form"]].map(([c,l])=>(
+          <th key={c} style={{...S.th,cursor:"pointer",color:c==="similar_course_adj"?"#f59e0b":undefined}} onClick={()=>setFieldSort(s=>s.col===c?{...s,dir:s.dir==="desc"?"asc":"desc"}:{col:c,dir:"desc"})}>{l}{fieldSort.col===c?" "+(fieldSort.dir==="asc"?"↑":"↓"):""}</th>
+        ))}
+      </tr></thead><tbody>
+        {fieldData.slice(0,showAll?999:100).map((p,i)=>{const isDgFit=topFit.has(p.id);const isBk=topBasket.has(p.id);const hasBk=(p.basket_rounds||0)>=MIN_BASKET_ROUNDS;return<tr key={p.id} style={{...(i%2?S.trO:S.trE),...(isDgFit?{borderLeft:"3px solid #22c55e"}:isBk?{borderLeft:"3px solid #f59e0b"}:{})}}>
+          <td style={S.tdR}>{i+1}</td><td style={{...S.tdN,...(isDgFit?{color:"#22c55e"}:isBk?{color:"#f59e0b"}:{})}}>{isDgFit?"🎯 ":""}{isBk?"🔶 ":""}{p.name}</td>
+          {["sg_dist","sg_acc","sg_app","sg_arg","sg_putt","sg_total","baseline","course_fit_adj","course_history_adj","similar_course_adj","recent_form_adj"].map(c=>{
+            const v=p[c]||0;const rank=p.ranks?.[c]?.[p.id];const isBkCol=c==="similar_course_adj";
+            if(isBkCol&&!hasBk)return<td key={c} style={{...S.td,color:"#334155"}}>—</td>;
+            return<td key={c} style={{...S.td,color:isBkCol?(v>0.01?"#f59e0b":v<-0.01?"#ef4444":"#475569"):(v>0.05?"#22c55e":v<-0.05?"#ef4444":"#94a3b8")}}>{fieldMode==="value"?(v>0?"+":"")+v.toFixed(3):rank?("#"+rank):"-"}</td>;
+          })}
+        </tr>;})}
+      </tbody></table></div>
+      {!showAll&&players.length>100&&<button onClick={()=>setShowAll(true)} style={{...S.btnSm,marginTop:8}}>Show All {players.length}</button>}
     </div>}
 
-    {/* RESULTS */}
-    {tab==="results"&&simRes&&<div style={S.panel}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><div><h2 style={S.h2}>Results</h2><p style={S.help}>{simCount.toLocaleString()} sims · ±95% CI · Click row to expand</p></div><button onClick={csvRes} style={S.btnSm}>⬇ CSV</button></div>
-      <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left",cursor:"pointer"}} onClick={()=>tSort("name","asc")}>Player</th>{[["sim_win","Win%"],["sim_top5","Top 5"],["sim_top10","Top 10"],["sim_top20","Top 20"],["sim_make_cut","Cut"],["avg_finish","Avg Pos"],["dg_win","DG Win%"]].map(([c,l])=>(<th key={c} style={{...S.th,cursor:"pointer"}} onClick={()=>tSort(c,c==="avg_finish"?"asc":"desc")}>{l}{sort.col===c?" "+(sort.dir==="asc"?"↑":"↓"):""}</th>))}</tr></thead><tbody>
-        {sorted.slice(0,100).map((p,i)=>{const isExp=expanded===p.id;return(<React.Fragment key={p.id}><tr style={{...(i%2?S.trO:S.trE),cursor:"pointer"}} onClick={()=>setExpanded(isExp?null:p.id)}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{p.name} <span style={{color:isExp?"#22d3ee":"#334155",fontSize:9}}>{isExp?"▼":"▶"}</span></td><td style={S.tdH}>{pFmt(p.sim_win)}<br/><span style={{fontSize:8,color:"#64748b"}}>±{(ci95(p.sim_win,simCount)*100).toFixed(2)}%</span></td><td style={S.td}>{pFmt(p.sim_top5)}<br/><span style={{fontSize:8,color:"#64748b"}}>±{(ci95(p.sim_top5,simCount)*100).toFixed(2)}%</span></td><td style={S.td}>{pFmt(p.sim_top10)}</td><td style={S.td}>{pFmt(p.sim_top20)}</td><td style={S.td}>{pFmt(p.sim_make_cut)}</td><td style={S.td}>{p.avg_finish?.toFixed(1)}</td><td style={S.tdD}>{p.dg_win>0?pFmt(p.dg_win):"-"}</td></tr>
-          {isExp&&<tr><td colSpan={9} style={{padding:0,borderBottom:"2px solid #22d3ee33"}}><PlayerCard player={p} n={simCount} bankroll={bankroll} kellyFrac={kellyFrac}/></td></tr>}</React.Fragment>);})}
-      </tbody></table></div></div>}
+    {/* ═══ SIMULATION ═══ */}
+    {tab==="simulation"&&<div style={S.panel}>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 280px",gap:18}}>
+        <div>
+          {histWeights&&<div style={{marginBottom:20,padding:14,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}>
+            <h3 style={S.h3}>📊 Historical Optimal Weights (5yr)</h3>
+            <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>Year</th><th style={S.th}>Dist</th><th style={S.th}>Acc</th><th style={{...S.th,color:"#475569",fontStyle:"italic"}}>OTT</th><th style={S.th}>App</th><th style={S.th}>ARG</th><th style={S.th}>Putt</th><th style={S.th}>n</th></tr></thead><tbody>
+              {histWeights.map((y,i)=>{const ott=y.opt.corrs.find(c=>c.k==="sg_ott")?.pct||0;return(<tr key={y.year} style={i%2?S.trO:S.trE}><td style={{...S.td,fontWeight:700}}>{y.year}</td><td style={{...S.td,color:"#22d3ee"}}>{Math.round(ott*OTT_DIST_RATIO)}%</td><td style={{...S.td,color:"#22d3ee"}}>{Math.round(ott*OTT_ACC_RATIO)}%</td><td style={{...S.td,color:"#475569",fontStyle:"italic"}}>{ott}%</td>{y.opt.corrs.filter(c=>c.k!=="sg_ott").map(c=><td key={c.k} style={{...S.td,color:"#22d3ee"}}>{c.pct}%</td>)}<td style={S.tdD}>{y.opt.n}</td></tr>);})}
+              {hwAggregate&&(()=>{const ott=hwAggregate.sg_ott||0;return<tr style={{background:"#0a2e1a"}}><td style={{...S.td,fontWeight:700,color:"#22c55e"}}>AVG</td><td style={{...S.td,fontWeight:700,color:"#22c55e"}}>{Math.round(ott*OTT_DIST_RATIO)}%</td><td style={{...S.td,fontWeight:700,color:"#22c55e"}}>{Math.round(ott*OTT_ACC_RATIO)}%</td><td style={{...S.td,color:"#475569",fontStyle:"italic"}}>{ott}%</td>{SG_CATS.filter(c=>c.k!=="sg_ott").map(c=><td key={c.k} style={{...S.td,fontWeight:700,color:"#22c55e"}}>{hwAggregate[c.k]}%</td>)}<td style={S.td}></td></tr>;})()}
+            </tbody></table></div>
+            {hwAggregate&&<button onClick={applyOptimal} style={{...S.btnSm,marginTop:8,background:"#22c55e"}}>Apply Optimal Weights →</button>}
+          </div>}
+          {histWeightsStatus&&!histWeights&&<div style={{fontSize:11,color:"#94a3b8",marginBottom:10}}>{histWeightsStatus}</div>}
 
-    {/* EV */}
-    {tab==="ev"&&simRes&&<div style={S.panel}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:8}}><h2 style={S.h2}>Expected Value</h2><div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}><span style={{fontSize:10,color:"#94a3b8"}}>Bankroll $</span><input type="number" value={bankroll} onChange={e=>setBankroll(+e.target.value)} style={{...S.inp,width:85,padding:"4px 7px",fontSize:11}} min={0}/><select value={kellyFrac} onChange={e=>setKellyFrac(+e.target.value)} style={{...S.inp,width:95,padding:"4px 7px",fontSize:11}}><option value={0.25}>¼ Kelly</option><option value={0.5}>½ Kelly</option><option value={1}>Full Kelly</option></select><button onClick={csvEV} style={S.btnSm}>⬇ CSV</button></div></div>
-      {!hasOdds&&<div style={S.warn}><b>No DraftKings odds loaded.</b></div>}
-      {hasOdds&&<React.Fragment><p style={S.help}>EV = Sim% − implied%. <span style={{color:"#22c55e"}}>Green = edge.</span></p>
-        <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player</th>{dSt.odds.flatMap(m=>[<th key={m+"_ev"} style={{...S.th,cursor:"pointer",color:"#22d3ee"}} onClick={()=>setEvS(s=>s.col==="ev_"+m?{...s,dir:s.dir==="desc"?"asc":"desc"}:{col:"ev_"+m,dir:"desc"})}>{MARKET_LABELS[m]} EV{evS.col==="ev_"+m?(evS.dir==="asc"?" ↑":" ↓"):""}</th>,<th key={m+"_s"} style={S.th}>Sim%</th>,<th key={m+"_o"} style={S.th}>Odds</th>,<th key={m+"_k"} style={{...S.th,color:"#22d3ee"}}>Kelly $</th>])}</tr></thead><tbody>
-          {evData.filter(p=>MARKETS.some(m=>p["ev_"+m]!=null)).slice(0,100).map((p,i)=>(<tr key={p.id} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{p.name}</td>{dSt.odds.flatMap(m=>{const ev=p["ev_"+m],k=p["kelly_"+m];return[<td key={"e"+m} style={{...S.td,fontWeight:700,color:(ev||0)>0.01?"#22c55e":(ev||0)<-0.02?"#ef4444":"#94a3b8"}}>{evFmt(ev)}</td>,<td key={"s"+m} style={S.td}>{pFmt(p["sim_"+m])}</td>,<td key={"o"+m} style={S.td}>{p["odds_"+m]?p["odds_"+m].toFixed(2):"-"}</td>,<td key={"k"+m} style={{...S.td,color:k>0?"#22d3ee":"#334155"}}>{k>0?"$"+k.toFixed(2):"-"}</td>];})}</tr>))}
-        </tbody></table></div></React.Fragment>}
+          <h2 style={S.h2}>SG Weights <span style={{fontSize:10,color:"#64748b",fontWeight:400}}>(sum to 100%)</span></h2>
+          <div style={{fontSize:10,color:"#94a3b8",marginBottom:12,padding:"7px 11px",background:"#0f172a",borderRadius:4,borderLeft:"3px solid #22d3ee"}}>SENSITIVITY ×{SENSITIVITY}</div>
+          {[{k:"dist",l:"Driving Distance"},{k:"acc",l:"Driving Accuracy"},{k:"app",l:"Approach"},{k:"arg",l:"Around Green"},{k:"putt",l:"Putting"}].map(s=>(<div key={s.k} style={S.slG}><div style={S.slH}><span style={S.slL}>{s.l}</span><span style={S.slV}>{sgW[s.k]}%</span></div><input type="range" min={0} max={100} value={sgW[s.k]} onChange={e=>adjSG(s.k,+e.target.value)} style={S.slider}/></div>))}
+          <div style={{padding:"6px 12px",background:"#0f172a",borderRadius:5,fontSize:11,color:"#94a3b8",marginBottom:16}}>Total: <b style={{color:Object.values(sgW).reduce((a,b)=>a+b,0)===100?"#22c55e":"#ef4444"}}>{Object.values(sgW).reduce((a,b)=>a+b,0)}%</b></div>
+          <h2 style={S.h2}>Context Multipliers <span style={{fontSize:10,color:"#64748b",fontWeight:400}}>(0–200%)</span></h2>
+          {[{k:"ch",l:"Course History"},{k:"cf",l:"Course Fit"},{k:"rf",l:"Recent Form"},{k:"sc",l:"AV Basket Fit",color:"#f59e0b"}].map(s=>(<div key={s.k} style={S.slG}><div style={S.slH}><span style={{...S.slL,color:s.color||"#e2e8f0"}}>{s.l}</span><span style={{...S.slV,color:s.color||"#22d3ee"}}>{ctxW[s.k]}%</span></div><input type="range" min={0} max={200} value={ctxW[s.k]} onChange={e=>setCtxW(w=>({...w,[s.k]:+e.target.value}))} style={S.slider}/></div>))}
+          <div style={{...S.dv,margin:"16px 0"}}/>
+          <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:12}}>{SIM_COUNTS.map(c=>(<button key={c} onClick={()=>setSimCount_(c)} style={{...S.simBtn,...(simCount===c?S.simBtnOn:{})}}>{c.toLocaleString()}</button>))}</div>
+          <button onClick={doSim} disabled={simRunning||!players.length} style={{...S.btnRun,opacity:(simRunning||!players.length)?0.6:1}}>{simRunning?"⏳ Running...":"▶ Run "+simCount.toLocaleString()+" Simulations"}</button>
+        </div>
+        <div style={S.side}>
+          <h3 style={S.h3}>Presets</h3><div style={{display:"flex",gap:4,marginBottom:8}}><input value={pName} onChange={e=>setPName(e.target.value)} placeholder="Name..." style={{...S.inp,fontSize:11,padding:"5px 8px"}}/><button onClick={savePre} disabled={!pName.trim()} style={{...S.btnSm,opacity:pName.trim()?1:0.4}}>Save</button></div>
+          {presets.map(p=>(<div key={p.name} style={{display:"flex",gap:3,marginBottom:3}}><button onClick={()=>{setSgW(p.sg);setCtxW(prev=>({...prev,...p.cx}));}} style={S.preBtn}>{p.name}</button><button onClick={()=>{const u=presets.filter(x=>x.name!==p.name);setPresets(u);sSet("presets",u);}} style={S.preDel}>✕</button></div>))}
+          <div style={{...S.dv,margin:"12px 0"}}/><h3 style={S.h3}>Quick Profiles</h3>
+          {[{n:"Balanced",sg:{dist:20,acc:10,app:30,arg:20,putt:20},cx:{ch:100,cf:100,rf:100,sc:100}},{n:"Ball Striker",sg:{dist:20,acc:10,app:40,arg:15,putt:15},cx:{ch:100,cf:120,rf:100,sc:100}},{n:"Scrambler",sg:{dist:5,acc:10,app:20,arg:35,putt:30},cx:{ch:100,cf:100,rf:100,sc:100}},{n:"Course Horse",sg:{dist:20,acc:10,app:30,arg:20,putt:20},cx:{ch:180,cf:150,rf:80,sc:150}}].map(q=>(<button key={q.n} onClick={()=>{setSgW(q.sg);setCtxW(q.cx);}} style={S.qpBtn}>{q.n}</button>))}
+        </div>
+      </div>
     </div>}
 
-    {/* MATCHUPS */}
-    {tab==="matchups"&&simRes&&<div style={S.panel}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:8}}><h2 style={S.h2}>72-Hole Matchup EV</h2><div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{fontSize:10,color:"#94a3b8"}}>Bankroll $</span><input type="number" value={bankroll} onChange={e=>setBankroll(+e.target.value)} style={{...S.inp,width:85,padding:"4px 7px",fontSize:11}} min={0}/><select value={kellyFrac} onChange={e=>setKellyFrac(+e.target.value)} style={{...S.inp,width:95,padding:"4px 7px",fontSize:11}}><option value={0.25}>¼ Kelly</option><option value={0.5}>½ Kelly</option><option value={1}>Full Kelly</option></select></div></div>
-      {!h2hData&&<div style={S.warn}>Re-run with ≤{MAX_STORE.toLocaleString()} sims.</div>}
-      {h2hData&&!matchupRows.length&&<div style={S.warn}>No matchup pairs found.</div>}
-      {h2hData&&matchupRows.length>0&&<React.Fragment><p style={S.help}>{matchupRows.length} pairs · sorted by best EV.</p>
-        <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player 1</th><th style={S.th}>Sim%</th><th style={S.th}>DK</th><th style={S.th}>Imp%</th><th style={{...S.th,color:"#22d3ee"}}>EV</th><th style={{...S.th,color:"#22d3ee"}}>Kelly</th><th style={{...S.th,textAlign:"left"}}>Player 2</th><th style={S.th}>Sim%</th><th style={S.th}>DK</th><th style={S.th}>Imp%</th><th style={{...S.th,color:"#22d3ee"}}>EV</th><th style={{...S.th,color:"#22d3ee"}}>Kelly</th></tr></thead><tbody>
-          {matchupRows.slice(0,100).map((m,i)=>(<tr key={i} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{m.name1}</td><td style={S.td}>{m.s1!=null?pFmtS(m.s1):"-"}</td><td style={S.td}>{m.dk1>1?m.dk1.toFixed(2):"-"}</td><td style={S.tdD}>{m.i1>0?pFmtS(m.i1):"-"}</td><td style={{...S.td,fontWeight:700,color:(m.ev1||0)>0.01?"#22c55e":(m.ev1||0)<-0.02?"#ef4444":"#94a3b8"}}>{evFmt(m.ev1)}</td><td style={{...S.td,color:m.k1>0?"#22d3ee":"#334155"}}>{m.k1>0?"$"+m.k1.toFixed(2):"-"}</td><td style={S.tdN}>{m.name2}</td><td style={S.td}>{m.s2!=null?pFmtS(m.s2):"-"}</td><td style={S.td}>{m.dk2>1?m.dk2.toFixed(2):"-"}</td><td style={S.tdD}>{m.i2>0?pFmtS(m.i2):"-"}</td><td style={{...S.td,fontWeight:700,color:(m.ev2||0)>0.01?"#22c55e":(m.ev2||0)<-0.02?"#ef4444":"#94a3b8"}}>{evFmt(m.ev2)}</td><td style={{...S.td,color:m.k2>0?"#22d3ee":"#334155"}}>{m.k2>0?"$"+m.k2.toFixed(2):"-"}</td></tr>))}
-        </tbody></table></div></React.Fragment>}
+    {/* ═══ RESULTS ═══ */}
+    {tab==="results"&&<div style={S.panel}>
+      {subTab==="sim_results"&&simRes&&<div>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><h2 style={S.h2}>Results ({simCount.toLocaleString()} sims)</h2><button onClick={csvRes} style={S.btnSm}>⬇ CSV</button></div>
+        <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left",cursor:"pointer"}} onClick={()=>tSort("name","asc")}>Player</th>{[["sim_win","Win%"],["sim_top5","Top 5"],["sim_top10","Top 10"],["sim_top20","Top 20"],["sim_make_cut","Cut"],["avg_finish","Avg Pos"],["dg_win","DG Win%"]].map(([c,l])=>(<th key={c} style={{...S.th,cursor:"pointer"}} onClick={()=>tSort(c,c==="avg_finish"?"asc":"desc")}>{l}{sort.col===c?" "+(sort.dir==="asc"?"↑":"↓"):""}</th>))}</tr></thead><tbody>
+          {sorted.slice(0,showAll?999:100).map((p,i)=>{const isExp=expanded===p.id;return(<React.Fragment key={p.id}><tr style={{...(i%2?S.trO:S.trE),cursor:"pointer"}} onClick={()=>setExpanded(isExp?null:p.id)}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{p.name} <span style={{color:isExp?"#22d3ee":"#334155",fontSize:9}}>{isExp?"▼":"▶"}</span></td><td style={S.tdH}>{pFmt(p.sim_win)}<br/><span style={{fontSize:8,color:"#64748b"}}>±{(ci95(p.sim_win,simCount)*100).toFixed(2)}%</span></td><td style={S.td}>{pFmt(p.sim_top5)}</td><td style={S.td}>{pFmt(p.sim_top10)}</td><td style={S.td}>{pFmt(p.sim_top20)}</td><td style={S.td}>{pFmt(p.sim_make_cut)}</td><td style={S.td}>{p.avg_finish?.toFixed(1)}</td><td style={S.tdD}>{p.dg_win>0?pFmt(p.dg_win):"-"}</td></tr>
+            {isExp&&<tr><td colSpan={9} style={{padding:0,borderBottom:"2px solid #22d3ee33"}}><PlayerCard player={p} n={simCount} bankroll={bankroll} kellyFrac={kellyFrac}/></td></tr>}</React.Fragment>);})}
+        </tbody></table></div>
+        {!showAll&&sorted.length>100&&<button onClick={()=>setShowAll(true)} style={{...S.btnSm,marginTop:8}}>Show All {sorted.length}</button>}
+      </div>}
+      {subTab==="ev"&&simRes&&<div>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:8}}><h2 style={S.h2}>EV Analysis</h2><div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{fontSize:10,color:"#94a3b8"}}>Bankroll $</span><input type="number" value={bankroll} onChange={e=>setBankroll(+e.target.value)} style={{...S.inp,width:85,padding:"4px 7px",fontSize:11}} min={0}/><select value={kellyFrac} onChange={e=>setKellyFrac(+e.target.value)} style={{...S.inp,width:95,padding:"4px 7px",fontSize:11}}><option value={0.25}>¼ Kelly</option><option value={0.5}>½ Kelly</option><option value={1}>Full Kelly</option></select><button onClick={csvEV} style={S.btnSm}>⬇ CSV</button></div></div>
+        {!hasOdds&&<div style={S.warn}>No odds loaded.</div>}
+        {hasOdds&&<div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player</th>{dSt.odds.flatMap(m=>[<th key={m+"e"} style={{...S.th,cursor:"pointer",color:"#22d3ee"}} onClick={()=>setEvS(s=>s.col==="ev_"+m?{...s,dir:s.dir==="desc"?"asc":"desc"}:{col:"ev_"+m,dir:"desc"})}>{MARKET_LABELS[m]} EV</th>,<th key={m+"s"} style={S.th}>Sim%</th>,<th key={m+"k"} style={{...S.th,color:"#22d3ee"}}>Kelly $</th>])}</tr></thead><tbody>
+          {evData.filter(p=>MARKETS.some(m=>p["ev_"+m]!=null)).slice(0,100).map((p,i)=>(<tr key={p.id} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{p.name}</td>{dSt.odds.flatMap(m=>{const ev=p["ev_"+m],k=p["kelly_"+m];return[<td key={"e"+m} style={{...S.td,fontWeight:700,color:(ev||0)>0.01?"#22c55e":(ev||0)<-0.02?"#ef4444":"#94a3b8"}}>{evFmt(ev)}</td>,<td key={"s"+m} style={S.td}>{pFmt(p["sim_"+m])}</td>,<td key={"k"+m} style={{...S.td,color:k>0?"#22d3ee":"#334155"}}>{k>0?"$"+k.toFixed(2):"-"}</td>];})}</tr>))}
+        </tbody></table></div>}
+      </div>}
+      {subTab==="matchups"&&simRes&&<div>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,marginBottom:8}}><h2 style={S.h2}>Matchup EV</h2><div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{fontSize:10,color:"#94a3b8"}}>Bankroll $</span><input type="number" value={bankroll} onChange={e=>setBankroll(+e.target.value)} style={{...S.inp,width:85,padding:"4px 7px",fontSize:11}} min={0}/><select value={kellyFrac} onChange={e=>setKellyFrac(+e.target.value)} style={{...S.inp,width:95,padding:"4px 7px",fontSize:11}}><option value={0.25}>¼ Kelly</option><option value={0.5}>½ Kelly</option><option value={1}>Full Kelly</option></select></div></div>
+        {!h2hData&&<div style={S.warn}>Run sim ≤{MAX_STORE.toLocaleString()} iters for H2H.</div>}
+        {h2hData&&matchupRows.length>0&&<div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>P1</th><th style={S.th}>Sim%</th><th style={S.th}>EV</th><th style={S.th}>Kelly</th><th style={{...S.th,textAlign:"left"}}>P2</th><th style={S.th}>Sim%</th><th style={S.th}>EV</th><th style={S.th}>Kelly</th></tr></thead><tbody>
+          {matchupRows.slice(0,100).map((m,i)=>(<tr key={i} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{m.name1}</td><td style={S.td}>{m.s1!=null?pFmtS(m.s1):"-"}</td><td style={{...S.td,fontWeight:700,color:(m.ev1||0)>0.01?"#22c55e":"#94a3b8"}}>{evFmt(m.ev1)}</td><td style={{...S.td,color:m.k1>0?"#22d3ee":"#334155"}}>{m.k1>0?"$"+m.k1.toFixed(2):"-"}</td><td style={S.tdN}>{m.name2}</td><td style={S.td}>{m.s2!=null?pFmtS(m.s2):"-"}</td><td style={{...S.td,fontWeight:700,color:(m.ev2||0)>0.01?"#22c55e":"#94a3b8"}}>{evFmt(m.ev2)}</td><td style={{...S.td,color:m.k2>0?"#22d3ee":"#334155"}}>{m.k2>0?"$"+m.k2.toFixed(2):"-"}</td></tr>))}
+        </tbody></table></div>}
+      </div>}
+      {subTab==="history"&&<div>
+        <h2 style={S.h2}>Simulation History</h2>
+        {compareItems.length>0&&<div style={{marginBottom:10,padding:"8px 12px",background:"#0f172a",border:"1px solid #334155",borderRadius:5,display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:11,color:"#94a3b8"}}>{compareItems.length===1?"Select one more":"Ready"}</span>{compareData&&<button onClick={()=>setShowCompare(s=>!s)} style={{...S.btnSm,fontSize:9}}>{showCompare?"Hide":"Compare"}</button>}<button onClick={()=>{setCompareItems([]);setShowCompare(false);}} style={S.preDel}>Clear</button></div>}
+        {showCompare&&compareData&&<div style={{marginBottom:16,border:"1px solid #1e293b",borderRadius:6,overflow:"hidden"}}><div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player</th><th style={{...S.th,color:"#22d3ee"}}>A Win%</th><th style={{...S.th,color:"#f59e0b"}}>B Win%</th><th style={S.th}>Δ</th></tr></thead><tbody>
+          {compareData.rows.map((r,i)=>(<tr key={r.name} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{r.name}</td><td style={{...S.td,color:"#22d3ee"}}>{pFmt(r.aW)}</td><td style={{...S.td,color:"#f59e0b"}}>{pFmt(r.bW)}</td><td style={{...S.td,fontWeight:700,color:r.dW>0.002?"#22c55e":r.dW<-0.002?"#ef4444":"#94a3b8"}}>{r.dW>0?"+":""}{(r.dW*100).toFixed(2)}%</td></tr>))}
+        </tbody></table></div></div>}
+        {!hist.length&&<div style={S.empty}>No simulations yet.</div>}
+        {hist.map(h=>{const isSel=compareItems.includes(h.id);const si=compareItems.indexOf(h.id);return(<div key={h.id} style={{...S.hCard,borderLeft:"3px solid "+(isSel?"#22d3ee":"#1e293b")}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}><span style={{fontSize:13,fontWeight:700,color:"#e2e8f0"}}>{h.t||"Tournament"}</span><div style={{display:"flex",gap:4}}><button onClick={()=>toggleCmp(h.id)} style={{...S.btnSm,fontSize:9,background:isSel?"#1e3a5f":"#1e293b",color:isSel?"#22d3ee":"#94a3b8"}}>{isSel?"✓ "+(si===0?"A":"B"):"Compare"}</button><button onClick={()=>{setSgW(h.sg);setCtxW(prev=>({...prev,...h.cx}));setTab("simulation");}} style={{...S.btnSm,fontSize:9}}>↺ Reload</button></div></div>
+          <div style={{fontSize:10,color:"#64748b"}}>{new Date(h.date).toLocaleString()} · {h.n?.toLocaleString()} sims</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:4}}>{h.top30?.slice(0,5).map((t,j)=>(<span key={j} style={S.hP}>{j+1}. {t.n} ({(t.w*100).toFixed(1)}%)</span>))}</div></div>);})}
+      </div>}
     </div>}
 
-    {/* GRADING */}
-    {tab==="grading"&&<div style={S.panel}><h2 style={S.h2}>Post-Tournament Grading</h2><p style={S.help}>Compare projections against actual results and see what SG categories mattered.</p>
-      <div style={S.section}><h3 style={S.h3}>Select Simulation</h3><select value={gradingSim?.id||""} onChange={e=>{const h=hist.find(x=>x.id===+e.target.value);setGradingSim(h||null);}} style={{...S.inp,maxWidth:500,marginBottom:10}}><option value="">Choose...</option>{hist.map(h=><option key={h.id} value={h.id}>{h.t} — {new Date(h.date).toLocaleDateString()} — {h.n?.toLocaleString()} sims</option>)}</select>
-        {gradingSim&&<div style={{padding:8,background:"#0f172a",borderRadius:5,fontSize:10,color:"#94a3b8",marginBottom:10}}><b style={{color:"#22d3ee"}}>{gradingSim.t}</b> · {gradingSim.n?.toLocaleString()} sims · D:{gradingSim.sg?.dist}% Ac:{gradingSim.sg?.acc}% Ap:{gradingSim.sg?.app}% AR:{gradingSim.sg?.arg}% P:{gradingSim.sg?.putt}%</div>}</div>
-      <div style={S.section}><h3 style={S.h3}>Fetch Actual Results</h3><div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}>
-          {!eventList&&<span style={{fontSize:11,color:"#f59e0b"}}>⚠ Load Historical Event List on the Setup tab first</span>}
-          {eventList&&<select value={gradeEventId?gradeEventId+"|"+gradeYear:""} onChange={e=>handleGradeEventSelect(e.target.value)} style={{...S.inp,maxWidth:400}}>
-            <option value="">Select completed tournament...</option>
-            {eventList.map((ev,i)=><option key={i} value={(ev.event_id||"")+"|"+(ev.calendar_year||"")}>{ev.event_name||ev.event_id} — {ev.calendar_year}{ev.course?" · "+ev.course:""}</option>)}
-          </select>}
-          {eventList&&<button onClick={fetchGradeResults} disabled={gradeLoading||!gradeEventId} style={{...S.btnP,opacity:gradeLoading||!gradeEventId?0.5:1}}>{gradeLoading?"⏳":"Fetch Results"}</button>}</div>
-        {gradeStatus&&<div style={{fontSize:11,color:gradeStatus.startsWith("✓")?"#22c55e":"#94a3b8",marginBottom:10}}>{gradeStatus}</div>}</div>
-
-      {gradingSim&&gradeResults&&(()=>{const simMap={};gradingSim.top30?.forEach(p=>simMap[p.id||p.n]=p);const matched=gradeResults.filter(r=>simMap[r.pid]||simMap[r.name]).map(r=>{const sp=simMap[r.pid]||simMap[r.name];return{name:r.name,finish:r.finish,simWin:sp?.w||0,simT5:sp?.t5||0,simT10:sp?.t10||0,simT20:sp?.t20||0};}).sort((a,b)=>a.finish-b.finish);
+    {/* ═══ GRADING ═══ */}
+    {tab==="grading"&&<div style={S.panel}>
+      <h2 style={S.h2}>Post-Tournament Grading</h2>
+      <div style={S.section}><h3 style={S.h3}>Select Simulation</h3><select value={gradingSim?.id||""} onChange={e=>{const h=hist.find(x=>x.id===+e.target.value);setGradingSim(h||null);}} style={{...S.inp,maxWidth:500,marginBottom:10}}><option value="">Choose...</option>{hist.map(h=><option key={h.id} value={h.id}>{h.t} — {new Date(h.date).toLocaleDateString()} — {h.n?.toLocaleString()} sims</option>)}</select></div>
+      <div style={S.section}><h3 style={S.h3}>Fetch Results</h3><div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}>
+        {!eventList&&<span style={{fontSize:11,color:"#f59e0b"}}>⚠ Load Event List on Setup tab</span>}
+        {eventList&&<select value={gradeEventId?gradeEventId+"|"+gradeYear:""} onChange={e=>handleEventSelect(e.target.value,setGradeEventId,setGradeYear)} style={{...S.inp,maxWidth:400}}><option value="">Select tournament...</option>{eventList.map((ev,i)=><option key={i} value={(ev.event_id||"")+"|"+(ev.calendar_year||"")}>{ev.event_name||ev.event_id} — {ev.calendar_year}</option>)}</select>}
+        {eventList&&<button onClick={fetchGradeResults} disabled={gradeLoading||!gradeEventId} style={{...S.btnP,opacity:gradeLoading?0.5:1}}>{gradeLoading?"⏳":"Fetch"}</button>}</div>
+        {gradeStatus&&<div style={{fontSize:11,color:gradeStatus.startsWith("✓")?"#22c55e":"#94a3b8"}}>{gradeStatus}</div>}</div>
+      {gradingSim&&gradeResults&&(()=>{const simMap={};gradingSim.top30?.forEach(p=>simMap[p.id||p.n]=p);const matched=gradeResults.filter(r=>simMap[r.pid]||simMap[r.name]).map(r=>{const sp=simMap[r.pid]||simMap[r.name];return{name:r.name,finish:r.finish,simWin:sp?.w||0,simT5:sp?.t5||0,simT10:sp?.t10||0};}).sort((a,b)=>a.finish-b.finish);
         const corr=matched.length>=5?spearmanCorr(matched.map(m=>m.simWin),matched.map(m=>m.finish)):null;
         const best=matched.filter(m=>m.simWin>0&&m.finish<=10).sort((a,b)=>b.simWin-a.simWin).slice(0,3);
         const worst=matched.filter(m=>m.simWin>0.01&&m.finish>50).slice(0,3);
         return<div style={S.section}><h3 style={S.h3}>📊 Projection vs Actual</h3>
           {corr!=null&&<div style={{padding:10,background:"#0f172a",borderRadius:6,marginBottom:12,display:"flex",gap:16,flexWrap:"wrap"}}><div><div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Rank Correlation</div><div style={{fontSize:20,fontWeight:700,color:corr<-0.3?"#22c55e":corr<-0.1?"#f59e0b":"#ef4444"}}>{corr.toFixed(3)}</div></div>
-            {best.length>0&&<div><div style={{fontSize:9,color:"#22c55e",textTransform:"uppercase",marginBottom:3}}>Best Calls</div>{best.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1"}}>{m.name}: {pFmtS(m.simWin)} → #{m.finish}</div>)}</div>}
-            {worst.length>0&&<div><div style={{fontSize:9,color:"#ef4444",textTransform:"uppercase",marginBottom:3}}>Worst Calls</div>{worst.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1"}}>{m.name}: {pFmtS(m.simWin)} → #{m.finish}</div>)}</div>}</div>}
-          <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>Finish</th><th style={{...S.th,textAlign:"left"}}>Player</th><th style={S.th}>Sim Win%</th><th style={S.th}>Sim T5%</th><th style={S.th}>Sim T10%</th><th style={S.th}>Sim T20%</th></tr></thead><tbody>
-            {matched.slice(0,50).map((m,i)=>(<tr key={m.name} style={i%2?S.trO:S.trE}><td style={{...S.td,fontWeight:700,color:m.finish<=5?"#22c55e":m.finish<=20?"#22d3ee":"#94a3b8"}}>{m.finish}</td><td style={S.tdN}>{m.name}</td><td style={S.td}>{pFmtS(m.simWin)}</td><td style={S.td}>{pFmtS(m.simT5)}</td><td style={S.td}>{pFmtS(m.simT10)}</td><td style={S.td}>{pFmtS(m.simT20)}</td></tr>))}
+            {best.length>0&&<div><div style={{fontSize:9,color:"#22c55e",marginBottom:3}}>BEST CALLS</div>{best.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1"}}>{m.name}: {pFmtS(m.simWin)} → #{m.finish}</div>)}</div>}
+            {worst.length>0&&<div><div style={{fontSize:9,color:"#ef4444",marginBottom:3}}>WORST CALLS</div>{worst.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1"}}>{m.name}: {pFmtS(m.simWin)} → #{m.finish}</div>)}</div>}</div>}
+          <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>Finish</th><th style={{...S.th,textAlign:"left"}}>Player</th><th style={S.th}>Sim Win%</th><th style={S.th}>Sim T5%</th><th style={S.th}>Sim T10%</th></tr></thead><tbody>
+            {matched.slice(0,50).map((m,i)=>(<tr key={m.name} style={i%2?S.trO:S.trE}><td style={{...S.td,fontWeight:700,color:m.finish<=5?"#22c55e":m.finish<=20?"#22d3ee":"#94a3b8"}}>{m.finish}</td><td style={S.tdN}>{m.name}</td><td style={S.td}>{pFmtS(m.simWin)}</td><td style={S.td}>{pFmtS(m.simT5)}</td><td style={S.td}>{pFmtS(m.simT10)}</td></tr>))}
           </tbody></table></div></div>;})()}
-
-      {gradeCorr&&<div style={S.section}><h3 style={S.h3}>🎯 What Mattered This Week</h3><p style={{fontSize:10,color:"#64748b",marginBottom:10}}>SG correlation to finish. n={gradeCorr.n}.</p>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:18}}><div>{gradeCorr.corrs.map(c=><CorrBar key={c.k} val={c.corr} label={c.l}/>)}</div>
-          <div style={{padding:14,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:12,fontWeight:700,color:"#f59e0b",marginBottom:8}}>Optimal Weights</div>
-            {gradeCorr.corrs.map(c=>(<div key={c.k} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid #1e293b"}}><span style={{fontSize:11,color:"#cbd5e1"}}>{c.l}</span><span style={{fontSize:13,fontWeight:700,color:"#f59e0b"}}>{c.suggestedPct}%</span></div>))}
-            {gradingSim&&<div style={{marginTop:12,fontSize:10,color:"#64748b"}}><b style={{color:"#94a3b8"}}>Your weights:</b> D:{gradingSim.sg?.dist}% Ac:{gradingSim.sg?.acc}% Ap:{gradingSim.sg?.app}% AR:{gradingSim.sg?.arg}% P:{gradingSim.sg?.putt}%</div>}
-          </div></div></div>}
-    </div>}
-
-    {/* HISTORY */}
-    {tab==="history"&&<div style={S.panel}><h2 style={S.h2}>Simulation History</h2>
-      {compareItems.length>0&&<div style={{marginBottom:10,padding:"8px 12px",background:"#0f172a",border:"1px solid #334155",borderRadius:5,display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:11,color:"#94a3b8"}}>{compareItems.length===1?"Select one more":"Ready"}</span>{compareData&&<button onClick={()=>setShowCompare(s=>!s)} style={{...S.btnSm,fontSize:9}}>{showCompare?"Hide":"Show"}</button>}<button onClick={()=>{setCompareItems([]);setShowCompare(false);}} style={{...S.preDel,fontSize:10}}>Clear</button></div>}
-      {showCompare&&compareData&&<div style={{marginBottom:16,border:"1px solid #1e293b",borderRadius:6,overflow:"hidden"}}><div style={{padding:"8px 12px",background:"#0f172a",display:"grid",gridTemplateColumns:"1fr auto 1fr",gap:8,fontSize:10}}><div><span style={{color:"#22d3ee"}}>A</span> · {compareData.a.n?.toLocaleString()} sims</div><div style={{color:"#475569"}}>vs</div><div style={{textAlign:"right"}}><span style={{color:"#f59e0b"}}>B</span> · {compareData.b.n?.toLocaleString()} sims</div></div>
-        <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player</th><th style={{...S.th,color:"#22d3ee"}}>A Win%</th><th style={{...S.th,color:"#f59e0b"}}>B Win%</th><th style={S.th}>Δ</th><th style={{...S.th,color:"#22d3ee"}}>A T5%</th><th style={{...S.th,color:"#f59e0b"}}>B T5%</th><th style={S.th}>Δ</th></tr></thead><tbody>
-          {compareData.rows.map((r,i)=>(<tr key={r.name} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{r.name}</td><td style={{...S.td,color:"#22d3ee"}}>{pFmt(r.aW)}</td><td style={{...S.td,color:"#f59e0b"}}>{pFmt(r.bW)}</td><td style={{...S.td,fontWeight:700,color:r.dW>0.002?"#22c55e":r.dW<-0.002?"#ef4444":"#94a3b8"}}>{r.dW>0?"+":""}{(r.dW*100).toFixed(2)}%</td><td style={{...S.td,color:"#22d3ee"}}>{pFmt(r.aT5)}</td><td style={{...S.td,color:"#f59e0b"}}>{pFmt(r.bT5)}</td><td style={{...S.td,fontWeight:700,color:r.dT5>0.005?"#22c55e":r.dT5<-0.005?"#ef4444":"#94a3b8"}}>{r.dT5>0?"+":""}{(r.dT5*100).toFixed(2)}%</td></tr>))}
-        </tbody></table></div></div>}
-      {!hist.length&&<div style={S.empty}>No simulations yet.</div>}
-      {hist.map(h=>{const isSel=compareItems.includes(h.id);const si=compareItems.indexOf(h.id);return(<div key={h.id} style={{...S.hCard,borderLeft:"3px solid "+(isSel?(si===0?"#22d3ee":"#f59e0b"):"#1e293b")}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}><span style={{fontSize:13,fontWeight:700,color:"#e2e8f0"}}>{h.t||"Tournament"}</span><div style={{display:"flex",gap:4}}><button onClick={()=>toggleCmp(h.id)} style={{...S.btnSm,fontSize:9,background:isSel?"#1e3a5f":"#1e293b",color:isSel?(si===0?"#22d3ee":"#f59e0b"):"#94a3b8"}}>{isSel?"✓ "+(si===0?"A":"B"):"Compare"}</button><button onClick={()=>{setSgW(h.sg);setCtxW(prev=>({...prev,...h.cx}));setTab("weights");}} style={{...S.btnSm,fontSize:9}}>↺ Reload</button></div></div>
-        <div style={{fontSize:10,color:"#64748b",marginBottom:5}}>{new Date(h.date).toLocaleString()} · {h.n?.toLocaleString()} sims · D:{h.sg?.dist}% Ac:{h.sg?.acc}% Ap:{h.sg?.app}% AR:{h.sg?.arg}% P:{h.sg?.putt}%</div>
-        <div style={{display:"flex",flexWrap:"wrap",gap:4}}>{h.top30?.slice(0,5).map((t,j)=>(<span key={j} style={S.hP}>{j+1}. {t.n} ({(t.w*100).toFixed(1)}%)</span>))}</div></div>);})}
+      {gradeCorr&&<div style={S.section}><h3 style={S.h3}>🎯 What Mattered</h3>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:18}}>
+          <div style={{padding:14,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:12,fontWeight:700,color:"#f59e0b",marginBottom:8}}>Actual SG Importance (n={gradeCorr.n})</div>
+            {gradeCorr.corrs.map(c=>(<div key={c.k} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid #1e293b"}}><span style={{fontSize:11,color:"#cbd5e1"}}>{c.l}</span><div><span style={{fontSize:13,fontWeight:700,color:"#f59e0b"}}>{c.suggestedPct}%</span><span style={{fontSize:9,color:"#475569",marginLeft:6}}>r={c.corr?.toFixed(2)}</span></div></div>))}
+            {gradingSim&&<div style={{marginTop:12,fontSize:10,color:"#64748b"}}><b>Your weights:</b> D:{gradingSim.sg?.dist}% Ac:{gradingSim.sg?.acc}% Ap:{gradingSim.sg?.app}% AR:{gradingSim.sg?.arg}% P:{gradingSim.sg?.putt}%</div>}
+          </div>
+          <div style={{fontSize:11,color:"#64748b",lineHeight:1.6,padding:"14px 0"}}>
+            <p>These weights show which SG categories most strongly correlated with finish position at this event.</p>
+            <p style={{marginTop:8}}>A higher % means that category was more predictive of who finished well. Compare against the weights you used in your simulation to see where your model was over/under-weighted.</p>
+          </div>
+        </div></div>}
     </div>}
   </div>);
 }
 
-/* ── PlayerCard ── */
-function PlayerCard({player:p,n,bankroll,kellyFrac}){
-  const smk={win:"sim_win",top_5:"sim_top5",top_10:"sim_top10",top_20:"sim_top20",make_cut:"sim_make_cut"};
-  const sgMax=Math.max(...[p.sg_dist,p.sg_acc,p.sg_app,p.sg_arg,p.sg_putt].map(v=>Math.abs(v||0)),0.05);
-  const bar=(v)=><div style={{display:"flex",alignItems:"center",gap:6}}><div style={{width:55,textAlign:"right",fontSize:10,color:"#94a3b8"}}>{v>0?"+":""}{(v||0).toFixed(3)}</div><div style={{flex:1,height:7,background:"#1e293b",borderRadius:4,overflow:"hidden"}}><div style={{width:Math.abs((v||0)/sgMax*100)+"%",height:"100%",background:v>=0?"#22c55e":"#ef4444",borderRadius:4}}/></div></div>;
-  return<div style={{padding:"14px 18px",background:"#090d14",display:"grid",gridTemplateColumns:"1fr 1fr",gap:18}}>
-    <div><div style={{fontSize:12,fontWeight:700,color:"#22d3ee",marginBottom:8}}>{p.name} — SG Profile</div>
-      {[["Drv Distance",p.sg_dist],["Drv Accuracy",p.sg_acc],["Approach",p.sg_app],["Around Green",p.sg_arg],["Putting",p.sg_putt]].map(([l,v])=>(<div key={l} style={{marginBottom:6}}><div style={{fontSize:9,color:"#64748b",marginBottom:2,textTransform:"uppercase"}}>{l}</div>{bar(v||0)}</div>))}
-      <div style={{marginTop:10,fontSize:10,color:"#64748b"}}>Base: <b style={{color:"#e2e8f0"}}>{p.baseline?.toFixed(4)||"—"}</b> · CH: <b style={{color:"#e2e8f0"}}>{(p.course_history_adj||0).toFixed(4)}</b> · Fit: <b style={{color:"#e2e8f0"}}>{(p.course_fit_adj||0).toFixed(4)}</b> · Form: <b style={{color:"#e2e8f0"}}>{(p.recent_form_adj||0).toFixed(4)}</b> · SimC: <b style={{color:"#a78bfa"}}>{(p.similar_course_adj||0).toFixed(4)}</b></div></div>
-    <div><div style={{fontSize:12,fontWeight:700,color:"#22d3ee",marginBottom:8}}>Probabilities & DK Odds</div>
-      {MARKETS.map(m=>{const sp=p[smk[m]]||0,od=p.playerOdds?.[m],ciVal=ci95(sp,n);const imp=od?.bestOdds>1?decToImp(od.bestOdds):null;const ev=imp!=null?sp-imp:null;const kb=ev!=null&&ev>0&&od?.bestOdds>1?kellyBet(sp,od.bestOdds,kellyFrac,bankroll):0;
-        return<div key={m} style={{marginBottom:7,padding:"6px 9px",background:"#0f172a",borderRadius:4}}><div style={{display:"flex",justifyContent:"space-between"}}><span style={{fontSize:10,fontWeight:600,color:"#cbd5e1"}}>{MARKET_LABELS[m]}</span><span style={{fontSize:11,fontWeight:700,color:"#22d3ee"}}>{pFmt(sp)}</span></div><div style={{fontSize:9,color:"#64748b",marginTop:1}}>CI: [{pFmt(Math.max(0,sp-ciVal))}, {pFmt(Math.min(1,sp+ciVal))}]</div>{od&&<div style={{fontSize:9,marginTop:3,display:"flex",justifyContent:"space-between",gap:4}}><span style={{color:"#475569"}}>DK {od.bestOdds.toFixed(2)} (imp {pFmt(imp)})</span><span style={{fontWeight:700,color:ev>0.01?"#22c55e":ev<-0.02?"#ef4444":"#64748b"}}>{evFmt(ev)}{kb>0?" · $"+kb.toFixed(2):""}</span></div>}</div>;})}
-    </div></div>;
-}
-
-/* ── PasteBox ── */
-function PasteBox({onImport}){const [t,setT]=useState("");const [st,setSt]=useState(null);const [log,setLog]=useState([]);const go=()=>{if(!t.trim())return;const r=onImport(t);setSt(r);if(r.ok){setLog(l=>[...l,r.msg]);setT("");}};
-  return(<div><label style={{fontSize:11,fontWeight:600,color:"#94a3b8",textTransform:"uppercase",letterSpacing:"0.05em"}}>Paste JSON Data</label><div style={{fontSize:10,color:"#64748b",marginBottom:4}}>Auto-detects: decompositions, predictions, skills, odds, matchups.</div>
-    <div style={{position:"relative"}}><textarea value={t} onChange={e=>setT(e.target.value)} rows={4} placeholder="Paste DataGolf JSON..." style={{width:"100%",padding:"9px 11px",fontSize:11,fontFamily:"'JetBrains Mono',monospace",background:"#1e293b",color:"#e2e8f0",border:"1px solid #334155",borderRadius:5,outline:"none",resize:"vertical",boxSizing:"border-box"}}/>{t.trim()&&<button onClick={go} style={{position:"absolute",bottom:8,right:8,padding:"4px 10px",fontSize:10,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:3,cursor:"pointer"}}>Import</button>}</div>
-    {st&&<div style={{fontSize:11,marginTop:3,padding:"4px 7px",borderRadius:3,background:st.ok?"#0a2e1a":"#1c1117",color:st.ok?"#4ade80":"#fca5a5",border:"1px solid "+(st.ok?"#166534":"#7f1d1d")}}>{st.msg}</div>}
-    {log.length>0&&<div style={{marginTop:6,display:"flex",flexWrap:"wrap",gap:3}}>{log.map((l,i)=>(<span key={i} style={{fontSize:9,padding:"2px 5px",borderRadius:3,background:"#164e63",color:"#67e8f9"}}>{l}</span>))}</div>}
-  </div>);
-}
-
-const S={root:{fontFamily:"'JetBrains Mono','SF Mono',monospace",background:"#0a0e17",color:"#e2e8f0",minHeight:"100vh"},header:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px 18px",borderBottom:"1px solid #1e293b",background:"linear-gradient(180deg,#0f172a,#0a0e17)"},hL:{display:"flex",alignItems:"center",gap:10},logo:{fontSize:24,color:"#22d3ee",filter:"drop-shadow(0 0 6px rgba(34,211,238,0.4))"},title:{fontSize:16,fontWeight:700,margin:0,color:"#f1f5f9"},sub:{fontSize:10,color:"#64748b",marginTop:1},badges:{display:"flex",gap:5,flexWrap:"wrap"},badge:{fontSize:9,padding:"2px 7px",borderRadius:3,background:"#1e293b",color:"#94a3b8",border:"1px solid #334155"},tabs:{display:"flex",gap:2,padding:"5px 18px",background:"#0f172a",borderBottom:"1px solid #1e293b",overflowX:"auto"},tab:{padding:"6px 12px",fontSize:10,fontWeight:500,fontFamily:"inherit",background:"transparent",color:"#64748b",border:"none",borderRadius:4,cursor:"pointer",whiteSpace:"nowrap"},tabOn:{background:"#1e293b",color:"#22d3ee"},tabOff:{opacity:0.3,cursor:"not-allowed"},panel:{padding:"18px",maxWidth:1200,margin:"0 auto"},section:{marginBottom:24,position:"relative",zIndex:1},h2:{fontSize:14,fontWeight:700,margin:"0 0 5px",color:"#f1f5f9"},h3:{fontSize:11,fontWeight:600,margin:"0 0 6px",color:"#cbd5e1"},help:{fontSize:11,color:"#64748b",margin:"0 0 12px",lineHeight:1.5},label:{display:"block",fontSize:10,fontWeight:600,color:"#94a3b8",marginBottom:4,textTransform:"uppercase",letterSpacing:"0.05em"},row:{display:"flex",gap:6},inp:{flex:1,padding:"8px 10px",fontSize:12,fontFamily:"inherit",background:"#1e293b",color:"#e2e8f0",border:"1px solid #334155",borderRadius:4,outline:"none"},ok:{fontSize:10,color:"#22c55e",marginTop:4},err:{margin:"8px 18px",padding:"8px 12px",background:"#1c1117",border:"1px solid #7f1d1d",borderRadius:4,fontSize:11,color:"#fca5a5"},warn:{marginBottom:12,padding:"10px 14px",background:"#1a1a0e",border:"1px solid #854d0e",borderRadius:5,fontSize:11,color:"#fbbf24",lineHeight:1.5},dv:{height:1,background:"#1e293b"},btnP:{padding:"8px 16px",fontSize:11,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:4,cursor:"pointer",whiteSpace:"nowrap"},btnSm:{padding:"4px 8px",fontSize:10,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:3,cursor:"pointer",whiteSpace:"nowrap"},btnBig:{width:"100%",padding:"12px 18px",fontSize:12,fontWeight:700,fontFamily:"inherit",background:"linear-gradient(135deg,#0891b2,#22d3ee)",color:"#0a0e17",border:"none",borderRadius:6,cursor:"pointer"},btnRun:{width:"100%",padding:"14px 18px",fontSize:14,fontWeight:700,fontFamily:"inherit",background:"linear-gradient(135deg,#059669,#22c55e)",color:"#0a0e17",border:"none",borderRadius:6,cursor:"pointer"},stRow:{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 12px",background:"#0f172a",borderRadius:5},loadBar:{marginTop:12,padding:"8px 12px",background:"#0a2e1a",border:"1px solid #166534",borderRadius:5,display:"flex",alignItems:"center",justifyContent:"space-between",fontSize:12,color:"#4ade80",fontWeight:600},side:{background:"#0f172a",border:"1px solid #1e293b",borderRadius:6,padding:12},slG:{marginBottom:16},slH:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:1},slL:{fontSize:12,fontWeight:600,color:"#e2e8f0"},slV:{fontSize:13,fontWeight:700,color:"#22d3ee",fontVariantNumeric:"tabular-nums",minWidth:36,textAlign:"right"},slider:{width:"100%"},preBtn:{flex:1,padding:"4px 7px",fontSize:10,fontFamily:"inherit",background:"#1e293b",color:"#94a3b8",border:"1px solid #334155",borderRadius:3,cursor:"pointer",textAlign:"left"},preDel:{padding:"2px 5px",fontSize:10,fontFamily:"inherit",background:"transparent",color:"#64748b",border:"none",cursor:"pointer"},qpBtn:{display:"block",width:"100%",padding:"6px 7px",fontSize:10,fontFamily:"inherit",background:"#1e293b",color:"#cbd5e1",border:"1px solid #334155",borderRadius:3,cursor:"pointer",textAlign:"left",marginBottom:2},empty:{fontSize:10,color:"#475569",fontStyle:"italic",padding:"4px 0"},simBtn:{padding:"6px 12px",fontSize:11,fontWeight:500,fontFamily:"inherit",background:"#1e293b",color:"#94a3b8",border:"1px solid #334155",borderRadius:4,cursor:"pointer"},simBtnOn:{background:"#164e63",color:"#22d3ee",borderColor:"#22d3ee"},cfgBox:{background:"#0f172a",border:"1px solid #1e293b",borderRadius:6,padding:12},tW:{overflowX:"auto",overflow:"auto",border:"1px solid #1e293b",borderRadius:6,position:"relative",zIndex:0},table:{width:"100%",borderCollapse:"collapse",fontSize:10,fontVariantNumeric:"tabular-nums"},th:{padding:"7px 9px",textAlign:"right",fontSize:8,fontWeight:700,color:"#64748b",textTransform:"uppercase",letterSpacing:"0.05em",borderBottom:"2px solid #1e293b",background:"#0f172a",position:"sticky",top:0,whiteSpace:"nowrap",userSelect:"none"},trE:{background:"#0a0e17"},trO:{background:"#0d1220"},td:{padding:"6px 9px",textAlign:"right",color:"#cbd5e1",borderBottom:"1px solid #111827",whiteSpace:"nowrap"},tdR:{padding:"6px 9px",textAlign:"center",color:"#475569",borderBottom:"1px solid #111827",fontSize:9,width:28},tdN:{padding:"6px 9px",textAlign:"left",color:"#f1f5f9",fontWeight:600,borderBottom:"1px solid #111827",whiteSpace:"nowrap"},tdH:{padding:"6px 9px",textAlign:"right",color:"#22d3ee",fontWeight:700,borderBottom:"1px solid #111827"},tdD:{padding:"6px 9px",textAlign:"right",color:"#475569",borderBottom:"1px solid #111827"},hCard:{padding:"10px 12px",background:"#0f172a",border:"1px solid #1e293b",borderRadius:6,marginBottom:6},hP:{fontSize:10,color:"#94a3b8",padding:"1px 5px",background:"#1e293b",borderRadius:3}};
+const S={root:{fontFamily:"'JetBrains Mono','SF Mono',monospace",background:"#0a0e17",color:"#e2e8f0",minHeight:"100vh"},header:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px 18px",borderBottom:"1px solid #1e293b",background:"linear-gradient(180deg,#0f172a,#0a0e17)"},hL:{display:"flex",alignItems:"center",gap:10},logo:{fontSize:24,color:"#22d3ee",filter:"drop-shadow(0 0 6px rgba(34,211,238,0.4))"},title:{fontSize:16,fontWeight:700,margin:0,color:"#f1f5f9"},sub:{fontSize:10,color:"#64748b",marginTop:1},badges:{display:"flex",gap:5,flexWrap:"wrap"},badge:{fontSize:9,padding:"2px 7px",borderRadius:3,background:"#1e293b",color:"#94a3b8",border:"1px solid #334155"},
+tabs:{display:"flex",gap:2,padding:"5px 18px",background:"#0f172a",borderBottom:"1px solid #1e293b",overflowX:"auto"},tab:{padding:"7px 14px",fontSize:11,fontWeight:600,fontFamily:"inherit",background:"transparent",color:"#64748b",border:"none",borderRadius:4,cursor:"pointer",whiteSpace:"nowrap"},tabOn:{background:"#1e293b",color:"#22d3ee"},tabOff:{opacity:0.3,cursor:"not-allowed"},
+subTabs:{display:"flex",gap:2,padding:"3px 18px 3px 36px",background:"#080c14",borderBottom:"1px solid #111827"},subTab:{padding:"4px 10px",fontSize:10,fontWeight:500,fontFamily:"inherit",background:"transparent",color:"#475569",border:"none",borderRadius:3,cursor:"pointer"},subTabOn:{background:"#1e293b",color:"#94a3b8"},
+panel:{padding:"18px",maxWidth:1200,margin:"0 auto"},section:{marginBottom:24,position:"relative",zIndex:1},h2:{fontSize:14,fontWeight:700,margin:"0 0 5px",color:"#f1f5f9"},h3:{fontSize:11,fontWeight:600,margin:"0 0 6px",color:"#cbd5e1"},
+row:{display:"flex",gap:6},inp:{flex:1,padding:"8px 10px",fontSize:12,fontFamily:"inherit",background:"#1e293b",color:"#e2e8f0",border:"1px solid #334155",borderRadius:4,outline:"none"},ok:{fontSize:10,color:"#22c55e",marginTop:4},err:{margin:"8px 18px",padding:"8px 12px",background:"#1c1117",border:"1px solid #7f1d1d",borderRadius:4,fontSize:11,color:"#fca5a5"},warn:{marginBottom:12,padding:"10px 14px",background:"#1a1a0e",border:"1px solid #854d0e",borderRadius:5,fontSize:11,color:"#fbbf24"},dv:{height:1,background:"#1e293b"},
+btnP:{padding:"8px 16px",fontSize:11,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:4,cursor:"pointer",whiteSpace:"nowrap"},btnSm:{padding:"4px 8px",fontSize:10,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:3,cursor:"pointer",whiteSpace:"nowrap"},btnBig:{width:"100%",padding:"12px 18px",fontSize:12,fontWeight:700,fontFamily:"inherit",background:"linear-gradient(135deg,#0891b2,#22d3ee)",color:"#0a0e17",border:"none",borderRadius:6,cursor:"pointer"},btnRun:{width:"100%",padding:"14px 18px",fontSize:14,fontWeight:700,fontFamily:"inherit",background:"linear-gradient(135deg,#059669,#22c55e)",color:"#0a0e17",border:"none",borderRadius:6,cursor:"pointer"},
+stRow:{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 12px",background:"#0f172a",borderRadius:5},loadBar:{marginTop:12,padding:"8px 12px",background:"#0a2e1a",border:"1px solid #166534",borderRadius:5,display:"flex",alignItems:"center",justifyContent:"space-between",fontSize:12,color:"#4ade80",fontWeight:600},
+side:{background:"#0f172a",border:"1px solid #1e293b",borderRadius:6,padding:12},slG:{marginBottom:14},slH:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:1},slL:{fontSize:12,fontWeight:600,color:"#e2e8f0"},slV:{fontSize:13,fontWeight:700,color:"#22d3ee",fontVariantNumeric:"tabular-nums",minWidth:36,textAlign:"right"},slider:{width:"100%"},
+preBtn:{flex:1,padding:"4px 7px",fontSize:10,fontFamily:"inherit",background:"#1e293b",color:"#94a3b8",border:"1px solid #334155",borderRadius:3,cursor:"pointer",textAlign:"left"},preDel:{padding:"2px 5px",fontSize:10,fontFamily:"inherit",background:"transparent",color:"#64748b",border:"none",cursor:"pointer"},qpBtn:{display:"block",width:"100%",padding:"6px 7px",fontSize:10,fontFamily:"inherit",background:"#1e293b",color:"#cbd5e1",border:"1px solid #334155",borderRadius:3,cursor:"pointer",textAlign:"left",marginBottom:2},empty:{fontSize:10,color:"#475569",fontStyle:"italic",padding:"4px 0"},
+simBtn:{padding:"6px 12px",fontSize:11,fontWeight:500,fontFamily:"inherit",background:"#1e293b",color:"#94a3b8",border:"1px solid #334155",borderRadius:4,cursor:"pointer"},simBtnOn:{background:"#164e63",color:"#22d3ee",borderColor:"#22d3ee"},
+tW:{overflowX:"auto",overflow:"auto",border:"1px solid #1e293b",borderRadius:6,position:"relative",zIndex:0},table:{width:"100%",borderCollapse:"collapse",fontSize:10,fontVariantNumeric:"tabular-nums"},th:{padding:"7px 9px",textAlign:"right",fontSize:8,fontWeight:700,color:"#64748b",textTransform:"uppercase",letterSpacing:"0.05em",borderBottom:"2px solid #1e293b",background:"#0f172a",position:"sticky",top:0,whiteSpace:"nowrap",userSelect:"none"},trE:{background:"#0a0e17"},trO:{background:"#0d1220"},td:{padding:"6px 9px",textAlign:"right",color:"#cbd5e1",borderBottom:"1px solid #111827",whiteSpace:"nowrap"},tdR:{padding:"6px 9px",textAlign:"center",color:"#475569",borderBottom:"1px solid #111827",fontSize:9,width:28},tdN:{padding:"6px 9px",textAlign:"left",color:"#f1f5f9",fontWeight:600,borderBottom:"1px solid #111827",whiteSpace:"nowrap"},tdH:{padding:"6px 9px",textAlign:"right",color:"#22d3ee",fontWeight:700,borderBottom:"1px solid #111827"},tdD:{padding:"6px 9px",textAlign:"right",color:"#475569",borderBottom:"1px solid #111827"},
+hCard:{padding:"10px 12px",background:"#0f172a",border:"1px solid #1e293b",borderRadius:6,marginBottom:6},hP:{fontSize:10,color:"#94a3b8",padding:"1px 5px",background:"#1e293b",borderRadius:3}};
 ReactDOM.render(<App/>,document.getElementById("root"));
 </script>
 </body>
