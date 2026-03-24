@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PGA Tournament Simulator v4.6</title>
+<title>PGA Tournament Simulator v4.8</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
@@ -46,7 +46,7 @@ const COURSE_SIM_COLS=[
   {c:"less_5_ft_sg",w:1},{c:"greater_5_less_15_sg",w:1},{c:"greater_15_sg",w:1}
 ];
 const SG_CATS=[{k:"sg_ott",l:"Off the Tee",sk:"dist"},{k:"sg_app",l:"Approach",sk:"app"},{k:"sg_arg",l:"Around Green",sk:"arg"},{k:"sg_putt",l:"Putting",sk:"putt"}];
-const RADAR_SG_KEYS=[{k:"ott_sg",l:"Off the Tee"},{k:"app_sg",l:"Approach"},{k:"arg_sg",l:"Around Green"},{k:"putt_sg",l:"Putting"}];
+const COURSE_SG_DISPLAY=[{k:"ott_sg",l:"Off the Tee"},{k:"app_sg",l:"Approach"},{k:"arg_sg",l:"Around Green"},{k:"putt_sg",l:"Putting"}];
 
 /* ── helpers ── */
 const normalRandom=()=>{let u=0,v=0;while(!u)u=Math.random();while(!v)v=Math.random();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);};
@@ -59,6 +59,7 @@ const kellyBet=(sp,dec,frac,br)=>{if(!dec||dec<=1||sp<=0)return 0;const b=dec-1,
 const downloadCSV=(rows,fname)=>{if(!rows.length)return;const hdrs=Object.keys(rows[0]);const csv=[hdrs.join(","),...rows.map(r=>hdrs.map(h=>{const v=r[h];return typeof v==="string"&&v.includes(",")?"\""+v+"\"":v??""}).join(","))].join("\n");const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download=fname;a.click();};
 const sGet=k=>{try{const v=localStorage.getItem("pga3_"+k);return v?JSON.parse(v):null;}catch{return null;}};
 const sSet=(k,v)=>{try{localStorage.setItem("pga3_"+k,JSON.stringify(v));}catch{}};
+const fmtEventLabel=(ev)=>{const name=ev.event_name||ev.event_id||"Unknown";const sd=ev.start_date||ev.date;if(sd){try{const d=new Date(sd+"T12:00:00");if(!isNaN(d)){return name+" "+d.toLocaleDateString("en",{month:"short"})+" "+d.getFullYear();}}catch{}}return name+" — "+(ev.calendar_year||"");};
 const parseCSV=(text)=>{const lines=text.split(/\r?\n/).filter(l=>l.trim());if(lines.length<2)return[];const hdr=lines[0].split(",").map(h=>h.replace(/"/g,"").trim());return lines.slice(1).map(line=>{const vals=[];let cur="",inQ=false;for(let i=0;i<line.length;i++){const c=line[i];if(c==='"'){inQ=!inQ;}else if(c===","&&!inQ){vals.push(cur);cur="";}else{cur+=c;}}vals.push(cur);const obj={};hdr.forEach((h,i)=>{const v=vals[i]?.trim();obj[h]=isNaN(v)||v===""?v:parseFloat(v);});return obj;});};
 
 /* ── course similarity ── */
@@ -85,25 +86,17 @@ const computeOptimalWeights=(rounds)=>{
   return{corrs:corrs.map((c,i)=>({...c,pct:Math.round(abs[i]/tot*100)})),n:entries.length};
 };
 
-/* ── Course characteristic radar data: scaled 0-1 per DG methodology ── */
-/* Each axis = how much this course's SG difficulty deviates from tour avg, */
-/* scaled so that the most extreme course in the CSV = 1.0 on that axis.   */
-/* This approximates DG's "correlation between golfer attribute and perf"  */
-/* since larger deviations = more skill differentiation = higher correlation */
-const buildCourseRadar=(course,allCourses)=>{
+/* ── Course SG Difficulty profile data ── */
+const buildCourseSG=(course,allCourses)=>{
   if(!course||!allCourses?.length)return null;
-  return RADAR_SG_KEYS.map(r=>{
+  return COURSE_SG_DISPLAY.map(r=>{
     const vals=allCourses.map(c=>c[r.k]).filter(v=>typeof v==="number"&&!isNaN(v));
-    if(!vals.length)return{l:r.l,scaled:0.5,raw:0,avg:0,minV:0,maxV:0};
-    const avg=vals.reduce((a,b)=>a+b,0)/vals.length;
-    /* Compute |deviation from avg| for all courses to find the max range */
+    const avg=vals.length?vals.reduce((a,b)=>a+b,0)/vals.length:0;
+    const raw=typeof course[r.k]==="number"?course[r.k]:avg;
+    const diff=raw-avg;
     const absDevs=vals.map(v=>Math.abs(v-avg));
     const maxDev=Math.max(...absDevs,0.0001);
-    const raw=typeof course[r.k]==="number"?course[r.k]:avg;
-    const dev=Math.abs(raw-avg);
-    /* Scale: 0 = no deviation from avg, 1 = max deviation among all courses */
-    const scaled=dev/maxDev;
-    return{l:r.l,scaled,raw,avg,dev};
+    return{l:r.l,raw,avg,diff,relPct:Math.abs(diff)/maxDev};
   });
 };
 
@@ -115,45 +108,31 @@ const findArr=d=>{if(Array.isArray(d))return d;if(typeof d!=="object"||!d)return
 const runSim=(players,weights,n)=>{if(!players.length)return{results:[],allScores:null};const st=weights.sg_dist+weights.sg_acc+weights.sg_app+weights.sg_arg+weights.sg_putt;const w=st>0?{dist:weights.sg_dist/st,acc:weights.sg_acc/st,app:weights.sg_app/st,arg:weights.sg_arg/st,putt:weights.sg_putt/st}:{dist:.2,acc:.2,app:.2,arg:.2,putt:.2};const skills=players.map(p=>{const userSG=p.sg_dist*w.dist+p.sg_acc*w.acc+p.sg_app*w.app+p.sg_arg*w.arg+p.sg_putt*w.putt;const eqSG=(p.sg_dist+p.sg_acc+p.sg_app+p.sg_arg+p.sg_putt)*0.2;const delta=(userSG-eqSG)*SENSITIVITY;const base=(p.baseline||0)+delta;return base+(p.course_history_adj||0)*weights.course_history+(p.course_fit_adj||0)*weights.course_fit+(p.recent_form_adj||0)*weights.recent_form+(p.similar_course_adj||0)*weights.similar_course;});const res=players.map(()=>({w:0,t5:0,t10:0,t20:0,mc:0,tp:0}));const store=n<=MAX_STORE;const allScores=store?[]:null;for(let s=0;s<n;s++){const sc=skills.map(sk=>{let t=0;for(let r=0;r<4;r++)t+=-(sk+normalRandom()*ROUND_STDEV);return t;});if(store)allScores.push(new Float32Array(sc));const ix=sc.map((v,i)=>({v,i})).sort((a,b)=>a.v-b.v);let pos=1;for(let j=0;j<ix.length;){let k=j;while(k<ix.length&&Math.abs(ix[k].v-ix[j].v)<.001)k++;const avg=(pos+pos+k-j-1)/2;for(let m=j;m<k;m++){const pi=ix[m].i;res[pi].tp+=avg;if(avg<=1)res[pi].w++;if(avg<=5)res[pi].t5++;if(avg<=10)res[pi].t10++;if(avg<=20)res[pi].t20++;if(avg<=65)res[pi].mc++;}pos+=k-j;j=k;}}return{results:players.map((p,i)=>({...p,sim_win:res[i].w/n,sim_top5:res[i].t5/n,sim_top10:res[i].t10/n,sim_top20:res[i].t20/n,sim_make_cut:res[i].mc/n,avg_finish:res[i].tp/n})),allScores};};
 const computeH2H=(allScores,players,pairs)=>{const idxMap={};players.forEach((p,i)=>idxMap[p.id]=i);const n=allScores.length,h2h={};for(const pair of pairs){const i=idxMap[pair.id1],j=idxMap[pair.id2];if(i==null||j==null)continue;let iW=0;for(let s=0;s<n;s++){if(allScores[s][i]<allScores[s][j])iW++;}h2h[pair.id1+"_"+pair.id2]=iW/n;h2h[pair.id2+"_"+pair.id1]=1-iW/n;}return h2h;};
 
-/* ══ Course SG Radar — DG-style with avg reference ══ */
-function CourseRadar({data,courseName,size=340}){
+/* ══ Course SG Difficulty Profile ══ */
+function CourseSGProfile({data,courseName}){
   if(!data||!data.length)return null;
-  const pad=40,cx=size/2,cy=size/2,r=size/2-pad,n=data.length;
-  const angleStep=2*Math.PI/n;
-  const pt=(frac,i)=>{const a=i*angleStep-Math.PI/2;return[cx+r*frac*Math.cos(a),cy+r*frac*Math.sin(a)];};
-  const polyPts=(vals)=>vals.map((v,i)=>pt(v,i).join(",")).join(" ");
-  const gridLevels=[0.25,0.5,0.75,1];
-  /* Avg course would be at 0 deviation = center. We show a dashed reference at 0.5 for visual anchor */
-  const avgLevel=0.15;/* avg PGA tour course sits near center since its deviation is ~0 */
-  return <div style={{textAlign:"center"}}>
-    <div style={{fontSize:13,fontWeight:700,color:"#e2e8f0",marginBottom:2}}>{courseName||"Course"}</div>
-    <div style={{fontSize:9,color:"#64748b",marginBottom:8}}>RELATIVE IMPORTANCE</div>
-    <svg width={size} height={size+30} viewBox={`0 0 ${size} ${size+30}`}>
-      {/* Grid rings with scale labels */}
-      {gridLevels.map(g=><g key={g}><polygon points={polyPts(data.map(()=>g))} fill="none" stroke="#334155" strokeWidth={0.7}/>
-        <text x={cx+4} y={cy-r*g+3} fill="#475569" fontSize={7}>{g.toFixed(2)}</text></g>)}
-      {/* Axis lines + labels */}
-      {data.map((d,i)=>{const a=i*angleStep-Math.PI/2;const lx=cx+(r+22)*Math.cos(a),ly=cy+(r+22)*Math.sin(a);
-        return <g key={i}><line x1={cx} y1={cy} x2={cx+r*Math.cos(a)} y2={cy+r*Math.sin(a)} stroke="#334155" strokeWidth={0.7}/>
-          <text x={lx} y={ly} fill="#cbd5e1" fontSize={10} fontWeight={600} textAnchor="middle" dominantBaseline="middle">{d.l}</text></g>;})}
-      {/* Avg PGA Tour Course reference (dashed, near center since avg deviation ≈ 0) */}
-      <polygon points={polyPts(data.map(()=>avgLevel))} fill="none" stroke="#64748b" strokeWidth={1.2} strokeDasharray="4,3"/>
-      {data.map((d,i)=>{const p=pt(avgLevel,i);return<circle key={"a"+i} cx={p[0]} cy={p[1]} r={2.5} fill="#64748b"/>;})}
-      {/* This course shape */}
-      <polygon points={polyPts(data.map(d=>d.scaled))} fill="rgba(34,211,238,0.18)" stroke="#22d3ee" strokeWidth={2.5}/>
-      {data.map((d,i)=>{const p=pt(d.scaled,i);return<circle key={i} cx={p[0]} cy={p[1]} r={4.5} fill="#22d3ee" stroke="#0a0e17" strokeWidth={1.5}/>;})}
-      {/* Value labels */}
-      {data.map((d,i)=>{const labelR=Math.max(d.scaled+0.1,0.25);const p=pt(labelR,i);
-        return <text key={"v"+i} x={p[0]} y={p[1]-(d.scaled>0.5?12:i>=2?12:-12)} fill="#e2e8f0" fontSize={10} textAnchor="middle" fontWeight={700}>{d.scaled.toFixed(2)}</text>;})}
-      {/* Legend */}
-      <line x1={size/2-80} y1={size+8} x2={size/2-60} y2={size+8} stroke="#64748b" strokeWidth={1.2} strokeDasharray="4,3"/>
-      <circle cx={size/2-70} cy={size+8} r={2} fill="#64748b"/>
-      <text x={size/2-55} y={size+11} fill="#94a3b8" fontSize={8}>Avg PGA TOUR Course</text>
-      <rect x={size/2+30} y={size+4} width={10} height={8} rx={1} fill="rgba(34,211,238,0.18)" stroke="#22d3ee" strokeWidth={1}/>
-      <text x={size/2+45} y={size+11} fill="#94a3b8" fontSize={8}>{courseName||"This Course"}</text>
-    </svg>
-    <div style={{fontSize:9,color:"#64748b",marginTop:4,maxWidth:360,margin:"4px auto 0",lineHeight:1.5}}>
-      Each axis shows how strongly a skill category predicts performance at this course relative to all PGA Tour courses. Higher values (closer to 1.0) mean that category differentiates players more here than at a typical course. Based on course SG difficulty characteristics scaled 0–1.
+  const maxAbsDiff=Math.max(...data.map(d=>Math.abs(d.diff)),0.001);
+  return <div style={{padding:16,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}>
+    <div style={{fontSize:13,fontWeight:700,color:"#e2e8f0",marginBottom:4}}>{courseName} — SG Difficulty vs Tour Average</div>
+    <div style={{fontSize:9,color:"#64748b",marginBottom:14}}>Negative = harder than avg PGA Tour course. Larger deviations = more player differentiation in that category.</div>
+    {data.map(d=>{const pct=d.diff/maxAbsDiff;const barW=Math.abs(pct)*42;const isHard=d.diff<0;
+      return <div key={d.l} style={{display:"grid",gridTemplateColumns:"110px 75px 1fr 60px",alignItems:"center",padding:"9px 0",borderBottom:"1px solid #1e293b"}}>
+        <div style={{fontSize:11,fontWeight:600,color:"#cbd5e1"}}>{d.l}</div>
+        <div style={{fontSize:13,fontWeight:700,color:isHard?"#f59e0b":"#22d3ee",textAlign:"right",paddingRight:14}}>{d.raw>=0?"+":""}{d.raw.toFixed(3)}</div>
+        <div style={{display:"flex",alignItems:"center",height:18}}>
+          <div style={{flex:1,position:"relative",height:12,background:"#1e293b",borderRadius:6}}>
+            <div style={{position:"absolute",left:"50%",top:0,bottom:0,width:1,background:"#475569"}}/>
+            <div style={{position:"absolute",top:1,bottom:1,borderRadius:5,
+              left:isHard?(50-barW)+"%":"50%",width:barW+"%",
+              background:isHard?"#f59e0b":"#22d3ee",opacity:0.8}}/>
+          </div>
+        </div>
+        <div style={{fontSize:8,color:"#475569",textAlign:"right"}}>avg {d.avg>=0?"+":""}{d.avg.toFixed(3)}</div>
+      </div>;})}
+    <div style={{display:"flex",justifyContent:"center",gap:16,marginTop:12,fontSize:9,color:"#64748b"}}>
+      <span>◀ Harder <span style={{color:"#f59e0b"}}>■</span></span>
+      <span style={{color:"#334155"}}>|</span>
+      <span><span style={{color:"#22d3ee"}}>■</span> Easier ▶</span>
     </div>
   </div>;
 }
@@ -182,7 +161,7 @@ function PlayerCard({player:p,n,bankroll,kellyFrac}){
 }
 
 /* ══════════════════════════════════ */
-/* ══════════  MAIN APP V4.6 ═══════ */
+/* ══════════  MAIN APP V4.7 ═══════ */
 /* ══════════════════════════════════ */
 function App(){
   const [tab,setTab]=useState("setup");const [subTab,setSubTab]=useState("sim_results");
@@ -207,21 +186,20 @@ function App(){
   const [playerSimCoursePerf,setPlayerSimCoursePerf]=useState(null);
   const [weatherData,setWeatherData]=useState(null);const [weatherLoading,setWeatherLoading]=useState(false);const [weatherCity,setWeatherCity]=useState("");
   const [eventList,setEventList]=useState(null);const [eventListLoading,setEventListLoading]=useState(false);const [eventListError,setEventListError]=useState("");
-  const [courseHistEventId,setCourseHistEventId]=useState("");const [courseHistYear,setCourseHistYear]=useState("2025");
-  const [courseHistLoading,setCourseHistLoading]=useState(false);const [courseHistStatus,setCourseHistStatus]=useState("");
-  const [histWeights,setHistWeights]=useState(null);const [histWeightsStatus,setHistWeightsStatus]=useState("");
+  const [histPasteText,setHistPasteText]=useState("");const [histPasteLog,setHistPasteLog]=useState([]);const [histEventId,setHistEventId]=useState("");
+  const [histWeights,setHistWeights]=useState(null);
   const [fieldMode,setFieldMode]=useState("value");const [fieldSort,setFieldSort]=useState({col:"sg_total",dir:"desc"});
-  const [gradingSim,setGradingSim]=useState(null);const [gradeEventId,setGradeEventId]=useState("");const [gradeYear,setGradeYear]=useState("2025");
+  const [gradingSim,setGradingSim]=useState(null);const [gradeEventId,setGradeEventId]=useState("");const [gradeYear,setGradeYear]=useState(String(new Date().getFullYear()));
   const [gradeLoading,setGradeLoading]=useState(false);const [gradeStatus,setGradeStatus]=useState("");
   const [gradeResults,setGradeResults]=useState(null);const [gradeCorr,setGradeCorr]=useState(null);
 
-  useEffect(()=>{const k=sGet("dg_key");if(k){setApiKey(k);setApiKeyInp(k);}const p=sGet("presets");if(p)setPresets(p);const h=sGet("hist");if(h)setHist(h);const sg=sGet("sgW");if(sg)setSgW(sg);const cx=sGet("ctxW");if(cx)setCtxW(prev=>({...prev,...cx}));const b=sGet("bankroll");if(b)setBankroll(b);const kf=sGet("kf");if(kf!=null)setKellyFrac(kf);const csv=sGet("courseCSV");if(csv)setCourseCSV(csv);const el=sGet("eventList");if(el)setEventList(el);},[]);
+  useEffect(()=>{const k=sGet("dg_key");if(k){setApiKey(k);setApiKeyInp(k);}const p=sGet("presets");if(p)setPresets(p);const h=sGet("hist");if(h)setHist(h);const sg=sGet("sgW");if(sg)setSgW(sg);const cx=sGet("ctxW");if(cx)setCtxW(prev=>({...prev,...cx}));const b=sGet("bankroll");if(b)setBankroll(b);const kf=sGet("kf");if(kf!=null)setKellyFrac(kf);const csv=sGet("courseCSV");if(csv)setCourseCSV(csv);const el=sGet("eventList");if(el)setEventList(el);const hr=sGet("histRounds");if(hr&&hr.length>0){/* rebuild weights from persisted rounds */const byY={};hr.forEach(r=>{const y=r._pasteYear||r.year||"?";if(!byY[y])byY[y]=[];byY[y].push(r);});const yd=[];Object.entries(byY).sort((a,b)=>b[0]-a[0]).forEach(([y,yR])=>{if(yR.length>10){const o=computeOptimalWeights(yR);if(o)yd.push({year:y,opt:o,rounds:yR.length});}});if(yd.length)setHistWeights(yd.slice(0,5));}},[]);
   useEffect(()=>{sSet("sgW",sgW);},[sgW]);useEffect(()=>{sSet("ctxW",ctxW);},[ctxW]);
   useEffect(()=>{sSet("bankroll",bankroll);},[bankroll]);useEffect(()=>{sSet("kf",kellyFrac);},[kellyFrac]);
   useEffect(()=>{if(!courseCSV||!tourney?.course)return;const m=fuzzyMatch(tourney.course,courseCSV);if(m){setCourseMatch(m);setCourseMatchManual(m.course);const vecs=buildCourseVecs(courseCSV);setSimilarCourses(findSimilarCourses(m.course,vecs,10));}},[courseCSV,tourney]);
 
   /* ── Course characteristic radar from CSV ── */
-  const courseRadarData=useMemo(()=>buildCourseRadar(courseMatch,courseCSV),[courseMatch,courseCSV]);
+  const courseSGData=useMemo(()=>buildCourseSG(courseMatch,courseCSV),[courseMatch,courseCSV]);
 
   const saveKey=()=>{const k=apiKeyInp.trim();setApiKey(k);sSet("dg_key",k);setError(null);};
   const parseMatchupPairs=(ma)=>{const pairs=[];(findArr(ma)||[]).forEach(m=>{const id1=m.p1_dg_id||m.player1_dg_id||null,id2=m.p2_dg_id||m.player2_dg_id||null;const n1=m.player1||m.p1_player_name||"",n2=m.player2||m.p2_player_name||"";let dk1=0,dk2=0;Object.entries(m).forEach(([k,v])=>{if(typeof v!=="number")return;const kl=k.toLowerCase().replace(/[\s_]/g,"");if(KNOWN_BOOKS.some(b=>kl.includes(b))){if(kl.includes("p1")||kl.includes("player1"))dk1=Math.max(dk1,v);if(kl.includes("p2")||kl.includes("player2"))dk2=Math.max(dk2,v);}});if(id1&&id2)pairs.push({id1,id2,name1:n1||String(id1),name2:n2||String(id2),dk1,dk2});});return pairs;};
@@ -278,54 +256,49 @@ function App(){
     for(let pi=0;pi<PROXIES.length;pi++){try{for(const season of seasons){try{const d=await dgFetch("/get-schedule",{key:apiK,tour:"pga",season:String(season)},pi);const arr=findArr(d);if(arr?.length)allEvts=allEvts.concat(arr.map(e=>({...e,calendar_year:e.calendar_year||e.year||season,event_id:e.event_id||""})));}catch{}}if(allEvts.length){const sorted=allEvts.sort((a,b)=>(b.calendar_year||0)-(a.calendar_year||0));setEventList(sorted);sSet("eventList",sorted);setEventListLoading(false);return;}}catch{}}
     setEventListError("Proxies failed — use Open ↗ then paste.");setEventListLoading(false);};
   const eventListUrl=DG_BASE+"/get-schedule?tour=pga&season=2025&file_format=json&key="+(apiKey||DG_KEY_HIST);
-  const handleEventSelect=(val,setEid,setYr)=>{if(!val){setEid("");return;}const [eid,yr]=val.split("|");setEid(eid);setYr(yr||"2025");};
+  const handleEventSelect=(val,setEid,setYr)=>{if(!val){setEid("");return;}const [eid]=val.split("|");setEid(eid);setYr(String(new Date().getFullYear()));};
 
-  /* ── Combined Course Analysis ── */
-  const fetchCourseHist=async()=>{if(!courseHistEventId)return;
-    setPlayerSimCoursePerf(null);setHistWeights(null);setHistWeightsStatus("");
-    setCourseHistLoading(true);setCourseHistStatus("Fetching...");
-    const years=[2026,2025,2024,2023,2022,2021,2020,2019];let allRounds=[];const yearData=[];let yearsWithData=0;
-    for(const yr of years){setCourseHistStatus("Fetching "+yr+"...");
-      try{const d=await dgFetchRetry("/historical-raw-data/rounds",{tour:"pga",event_id:courseHistEventId,year:yr});
-        const rounds=parseRoundsData(d,{year:yr});
-        if(rounds.length>0){allRounds=allRounds.concat(rounds);yearsWithData++;
-          if(rounds.length>10){const opt=computeOptimalWeights(rounds);if(opt)yearData.push({year:yr,opt,rounds:rounds.length});}}}catch{}}
-    if(!allRounds.length){setCourseHistStatus("No data found.");setCourseHistLoading(false);return;}
-    /* Per-year historical weights (max 5) */
-    if(yearData.length){setHistWeights(yearData.slice(0,5));setHistWeightsStatus("✓ "+yearData.length+" years with weights ("+yearsWithData+" with data)");}
-    else{setHistWeightsStatus("Data found ("+yearsWithData+" yrs) but insufficient per-year sample for weights.");}
-    /* Similar courses: similarity-weighted basket with min rounds */
-    if(similarCourses.length>0&&eventList?.length>0){setCourseHistStatus("Fetching similar courses...");let simRounds=[];
-      const simMap={};similarCourses.forEach(c=>{
-        /* Store multiple name variants for better matching */
-        const full=c.course.toLowerCase();simMap[full]=c.sim;
-        /* Extract key words: strip parentheticals, "resort", "golf", "club", "course" */
-        const core=full.replace(/\(.*?\)/g,"").replace(/\b(resort|golf|club|course|country|national|links)\b/g,"").replace(/[^a-z0-9\s]/g,"").trim().replace(/\s+/g," ");
-        if(core.length>=4)simMap[core]=c.sim;
+  /* ── Process pasted historical rounds (no proxies needed) ── */
+  const processHistPaste=()=>{
+    if(!histPasteText.trim())return;
+    try{
+      const raw=JSON.parse(histPasteText.trim());
+      const rounds=parseRoundsData(raw);
+      if(!rounds.length){setHistPasteLog(l=>[...l,{ok:false,msg:"No rounds found in pasted data."}]);return;}
+      /* Detect year from data */
+      const yr=rounds[0]?.year||raw?.calendar_year||raw?.season||"?";
+      /* Accumulate with existing pasted rounds */
+      const existing=sGet("histRounds")||[];
+      const combined=[...existing,...rounds.map(r=>({...r,_pasteYear:yr}))];
+      sSet("histRounds",combined);
+      /* Rebuild weights from accumulated rounds */
+      const byYear={};combined.forEach(r=>{const y=r._pasteYear||r.year||"?";if(!byYear[y])byYear[y]=[];byYear[y].push(r);});
+      const yearData=[];Object.entries(byYear).sort((a,b)=>b[0]-a[0]).forEach(([y,yRounds])=>{
+        if(yRounds.length>10){const opt=computeOptimalWeights(yRounds);if(opt)yearData.push({year:y,opt,rounds:yRounds.length});}
       });
-      const simKeys=Object.keys(simMap);
-      const matchEvent=(eName)=>{const en=(eName||"").toLowerCase().replace(/\(.*?\)/g,"").replace(/\b(resort|golf|club|course|country|national|links)\b/g,"").replace(/[^a-z0-9\s]/g,"").trim().replace(/\s+/g," ");
-        for(const sk of simKeys){if(en.includes(sk.substring(0,Math.min(12,sk.length)))||sk.includes(en.substring(0,Math.min(12,en.length))))return simMap[sk];}return null;};
-      const matched=[];eventList.forEach(e=>{const sim=matchEvent(e.course||e.event_name||"");if(sim!==null)matched.push({...e,_simScore:sim});});
-      setCourseHistStatus("Fetching similar courses ("+matched.length+" matched events)...");
-      for(const evt of matched.slice(0,20)){try{const d=await dgFetchRetry("/historical-raw-data/rounds",{tour:"pga",event_id:evt.event_id,year:evt.calendar_year||evt.year});const rounds=parseRoundsData(d);rounds.forEach(r=>r._simWeight=evt._simScore||0.8);simRounds=simRounds.concat(rounds);}catch{}}
-      if(simRounds.length>0){
-        /* Similarity-weighted per-player aggregate */
-        const pa={};simRounds.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;if(!pa[pid])pa[pid]={name:r.player_name,rounds:0,weightedSG:0,totalWeight:0};const w=r._simWeight||0.8;pa[pid].rounds++;pa[pid].weightedSG+=(r.sg_total||0)*w;pa[pid].totalWeight+=w;});
-        Object.values(pa).forEach(p=>{if(p.totalWeight>0)p.sg_avg=p.weightedSG/p.totalWeight;else p.sg_avg=0;});
-        /* Normalize to DG fit scale */
-        const qualified=Object.values(pa).filter(p=>p.rounds>=MIN_BASKET_ROUNDS);
-        const rawVals=qualified.map(p=>p.sg_avg);
-        const rawMean=rawVals.length?rawVals.reduce((a,b)=>a+b,0)/rawVals.length:0;
+      if(yearData.length)setHistWeights(yearData.slice(0,5));
+      /* Rebuild basket: aggregate per player across all pasted rounds */
+      const pa={};combined.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;if(!pa[pid])pa[pid]={name:r.player_name,rounds:0,sg_total:0};pa[pid].rounds++;pa[pid].sg_total+=(r.sg_total||0);});
+      Object.values(pa).forEach(p=>{if(p.rounds>0)p.sg_total/=p.rounds;});
+      /* Normalize to DG fit scale */
+      const qualified=Object.values(pa).filter(p=>p.rounds>=MIN_BASKET_ROUNDS);
+      if(qualified.length>0&&players.length>0){
+        const rawVals=qualified.map(p=>p.sg_total);
+        const rawMean=rawVals.reduce((a,b)=>a+b,0)/rawVals.length;
         const rawStd=rawVals.length>1?Math.sqrt(rawVals.reduce((s,v)=>s+(v-rawMean)**2,0)/rawVals.length):1;
         const fitVals=players.map(p=>p.course_fit_adj||0).filter(v=>Math.abs(v)>0.001);
         const fitMean=fitVals.length?fitVals.reduce((a,b)=>a+b,0)/fitVals.length:0;
         const fitStd=fitVals.length>1?Math.sqrt(fitVals.reduce((s,v)=>s+(v-fitMean)**2,0)/fitVals.length):0.15;
-        Object.values(pa).forEach(p=>{p.basket_fit=p.rounds>=MIN_BASKET_ROUNDS&&rawStd>0.001?((p.sg_avg-rawMean)/rawStd)*fitStd+fitMean:0;});
+        Object.values(pa).forEach(p=>{p.basket_fit=p.rounds>=MIN_BASKET_ROUNDS&&rawStd>0.001?((p.sg_total-rawMean)/rawStd)*fitStd+fitMean:0;});
         setPlayerSimCoursePerf(pa);
-        setPlayers(prev=>prev.map(pl=>{const perf=pa[pl.id]||pa[pl.name];return{...pl,similar_course_adj:perf&&perf.rounds>=MIN_BASKET_ROUNDS?perf.basket_fit:0,basket_rounds:perf?perf.rounds:0};}));}}
-    setCourseHistStatus("✓ Analysis complete ("+allRounds.length+" rounds)");setCourseHistLoading(false);
+        setPlayers(prev=>prev.map(pl=>{const perf=pa[pl.id]||pa[pl.name];return{...pl,similar_course_adj:perf&&perf.rounds>=MIN_BASKET_ROUNDS?perf.basket_fit:0,basket_rounds:perf?perf.rounds:0};}));
+      }
+      setHistPasteLog(l=>[...l,{ok:true,msg:"✓ Year "+yr+": "+rounds.length+" rounds ("+combined.length+" total accumulated)"}]);
+      setHistPasteText("");
+    }catch(e){setHistPasteLog(l=>[...l,{ok:false,msg:"JSON error: "+e.message}]);}
   };
+  const clearHistPaste=()=>{sSet("histRounds",null);setHistWeights(null);setHistPasteLog([]);setPlayerSimCoursePerf(null);
+    setPlayers(prev=>prev.map(pl=>({...pl,similar_course_adj:0,basket_rounds:0})));};
 
   const hwAggregate=useMemo(()=>{if(!histWeights)return null;
     const avg={};SG_CATS.forEach(c=>{avg[c.k]=Math.round(histWeights.reduce((s,y)=>{const f=y.opt.corrs.find(x=>x.k===c.k);return s+(f?.pct||0);},0)/histWeights.length);});
@@ -343,13 +316,13 @@ function App(){
 
   const fetchGradeResults=async()=>{if(!gradeEventId)return;setGradeLoading(true);setGradeStatus("Fetching...");setGradeResults(null);setGradeCorr(null);
     try{const d=await dgFetchRetry("/historical-raw-data/rounds",{tour:"pga",event_id:gradeEventId,year:gradeYear});const rounds=parseRoundsData(d);
-      if(!rounds.length){setGradeStatus("No data.");setGradeLoading(false);return;}
+      if(!rounds.length){setGradeStatus("No round data available yet — DataGolf may need 1-2 days after the event ends.");setGradeLoading(false);return;}
       const byP={};rounds.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;if(!byP[pid])byP[pid]={pid,name:r.player_name,finish:999,rounds:0,sg_ott:0,sg_app:0,sg_arg:0,sg_putt:0};const p=byP[pid];p.rounds++;p.sg_ott+=(r.sg_ott||0);p.sg_app+=(r.sg_app||0);p.sg_arg+=(r.sg_arg||0);p.sg_putt+=(r.sg_putt||0);const fn=parseInt(String(r.fin_text).replace(/\D/g,""))||999;p.finish=Math.min(p.finish,fn);});
       const results=Object.values(byP).filter(r=>r.rounds>0).sort((a,b)=>a.finish-b.finish);setGradeResults(results);
       const valid=results.filter(r=>r.rounds>=3&&r.finish<900);
       if(valid.length>=10){const fin=valid.map(r=>r.finish);const corrs=SG_CATS.map(c=>({...c,corr:spearmanCorr(valid.map(r=>r[c.k]),fin)}));const abs=corrs.map(c=>Math.abs(c.corr));const tot=abs.reduce((a,b)=>a+b,0)||1;setGradeCorr({corrs:corrs.map((c,i)=>({...c,suggestedPct:Math.round(abs[i]/tot*100)})),n:valid.length});}
       setGradeStatus("✓ "+results.length+" players");
-    }catch(e){setGradeStatus("Error: "+e.message);}setGradeLoading(false);};
+    }catch(e){setGradeStatus("Error: "+e.message+(e.message.includes("proxies")?" — try again in a minute or check your API key.":""));}setGradeLoading(false);};
 
   /* ── Apply optimal weights + context multipliers ── */
   const applyOptimal=()=>{if(!hwAggregate)return;const ott=hwAggregate.sg_ott||25;const d=Math.round(ott*OTT_DIST_RATIO);const a=ott-d;const app=hwAggregate.sg_app||25;const arg=hwAggregate.sg_arg||25;const putt=hwAggregate.sg_putt||25;const tot=d+a+app+arg+putt;const adj=100-tot;setSgW({dist:d,acc:a,app:app+adj,arg,putt});};
@@ -378,7 +351,7 @@ function App(){
   const RESULT_SUBS=[["sim_results","Results"],["ev","EV Analysis"],["matchups","Matchups"],["history","History"]];
 
   return(<div style={S.root}>
-    <div style={S.header}><div style={S.hL}><div style={S.logo}>◆</div><div><h1 style={S.title}>PGA Tournament Simulator <span style={{fontSize:9,color:"#22d3ee",background:"#164e63",padding:"1px 6px",borderRadius:3}}>v4.6</span></h1><div style={S.sub}>{tourney?tourney.name+" · "+tourney.course:"Course Intel · Field Analysis · Monte Carlo · Grading"}</div></div></div>
+    <div style={S.header}><div style={S.hL}><div style={S.logo}>◆</div><div><h1 style={S.title}>PGA Tournament Simulator <span style={{fontSize:9,color:"#22d3ee",background:"#164e63",padding:"1px 6px",borderRadius:3}}>v4.8</span></h1><div style={S.sub}>{tourney?tourney.name+" · "+tourney.course:"Course Intel · Field Analysis · Monte Carlo · Grading"}</div></div></div>
       <div style={S.badges}>{players.length>0&&<span style={S.badge}>{players.length} players</span>}{simRes&&<span style={S.badge}>{simCount.toLocaleString()} sims</span>}{courseCSV&&<span style={{...S.badge,color:"#a78bfa",borderColor:"#7c3aed"}}>{courseCSV.length} courses</span>}</div></div>
     <div style={S.tabs}>{TABS.map(([id,lb,en])=>(<button key={id} disabled={!en} onClick={()=>{setTab(id);if(id==="results")setSubTab("sim_results");}} style={{...S.tab,...(tab===id?S.tabOn:{}),...(!en?S.tabOff:{})}}>{lb}</button>))}</div>
     {tab==="results"&&<div style={S.subTabs}>{RESULT_SUBS.map(([id,lb])=>(<button key={id} onClick={()=>setSubTab(id)} style={{...S.subTab,...(subTab===id?S.subTabOn:{})}}>{lb}</button>))}</div>}
@@ -395,7 +368,7 @@ function App(){
       <div style={{display:"flex",flexDirection:"column",gap:5}}>
         {[{key:"decomp",label:"Player Decompositions",req:true,on:dSt.decomp,path:"/preds/player-decompositions?tour=pga"},{key:"preds",label:"Pre-Tournament Predictions",on:dSt.preds,path:"/preds/pre-tournament?tour=pga&odds_format=percent"},{key:"skills",label:"Skill Ratings",on:dSt.skills,path:"/preds/skill-ratings?display=value"},{key:"odds_win",label:"Odds — Win",on:dSt.odds.includes("win"),path:"/betting-tools/outrights?tour=pga&market=win&odds_format=decimal"},{key:"odds_t5",label:"Odds — Top 5",on:dSt.odds.includes("top_5"),path:"/betting-tools/outrights?tour=pga&market=top_5&odds_format=decimal"},{key:"odds_t10",label:"Odds — Top 10",on:dSt.odds.includes("top_10"),path:"/betting-tools/outrights?tour=pga&market=top_10&odds_format=decimal"},{key:"odds_t20",label:"Odds — Top 20",on:dSt.odds.includes("top_20"),path:"/betting-tools/outrights?tour=pga&market=top_20&odds_format=decimal"},{key:"matchups",label:"Matchups ("+dSt.matchups+")",on:dSt.matchups>0,path:"/betting-tools/matchups?tour=pga&market=tournament_matchups&odds_format=decimal"}].map(d=>(<div key={d.key} style={{...S.stRow,borderLeft:"3px solid "+(d.on?"#22c55e":d.req?"#f59e0b":"#334155")}}><div style={{flex:1}}><span style={{color:d.on?"#22c55e":"#64748b",fontWeight:600,fontSize:12}}>{d.on?"✓":"○"} {d.label}</span></div>{apiKey&&!d.on&&<button onClick={()=>window.open(DG_BASE+d.path+"&file_format=json&key="+apiKey,"_blank")} style={S.btnSm}>Open ↗</button>}</div>))}
       </div>
-      <div style={{marginTop:8,...S.stRow,borderLeft:"3px solid "+(eventList?"#22c55e":"#334155")}}><div style={{flex:1}}><span style={{color:eventList?"#22c55e":"#64748b",fontWeight:600,fontSize:12}}>{eventList?"✓":"○"} Historical Event List{eventList?" ("+eventList.length+")":""}</span><div style={{fontSize:10,color:"#475569",marginTop:1}}>For Course & Grading — load once</div></div><div style={{display:"flex",gap:4}}>{!eventList&&<button onClick={fetchEventList} disabled={eventListLoading} style={S.btnSm}>{eventListLoading?"⏳":"Load"}</button>}{!eventList&&<button onClick={()=>window.open(eventListUrl,"_blank")} style={S.btnSm}>Open ↗</button>}</div></div>
+      <div style={{marginTop:8,...S.stRow,borderLeft:"3px solid "+(eventList?"#22c55e":"#334155")}}><div style={{flex:1}}><span style={{color:eventList?"#22c55e":"#64748b",fontWeight:600,fontSize:12}}>{eventList?"✓":"○"} Historical Event List{eventList?" ("+eventList.length+")":""}</span><div style={{fontSize:10,color:"#475569",marginTop:1}}>For Course & Grading — load once</div></div><div style={{display:"flex",gap:4}}><button onClick={()=>{if(eventList){setEventList(null);sSet("eventList",null);setTimeout(fetchEventList,50);}else{fetchEventList();}}} disabled={eventListLoading} style={S.btnSm}>{eventListLoading?"⏳":eventList?"↻ Refresh":"Load"}</button>{!eventList&&<button onClick={()=>window.open(eventListUrl,"_blank")} style={S.btnSm}>Open ↗</button>}</div></div>
       {eventListError&&<div style={{fontSize:10,color:"#fca5a5",marginTop:4}}>{eventListError}</div>}
       <div style={{marginTop:8,...S.stRow,borderLeft:"3px solid "+(courseCSV?"#22c55e":"#334155")}}><div style={{flex:1}}><span style={{color:courseCSV?"#22c55e":"#64748b",fontWeight:600,fontSize:12}}>{courseCSV?"✓":"○"} Course Characteristics CSV{courseCSV?" ("+courseCSV.length+" courses)":""}</span></div><input type="file" accept=".csv" onChange={handleCSVUpload} style={{fontSize:10,color:"#94a3b8",maxWidth:200}}/></div>
       <div style={{marginTop:14}}><PasteBox onImport={handleImport}/></div>
@@ -411,22 +384,29 @@ function App(){
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(110px,1fr))",gap:8}}>{[["Par",courseMatch.par],["Yards",courseMatch.yardage],["Adj Score",courseMatch.adj_score_to_par?.toFixed(2)],["FW Width",courseMatch.fw_width?.toFixed(1)],["SG Putt",courseMatch.putt_sg?.toFixed(3)],["SG App",courseMatch.app_sg?.toFixed(3)],["SG OTT",courseMatch.ott_sg?.toFixed(3)],["SG ARG",courseMatch.arg_sg?.toFixed(3)]].map(([l,v])=>(<div key={l}><div style={{fontSize:8,color:"#64748b",textTransform:"uppercase"}}>{l}</div><div style={{fontSize:13,fontWeight:700,color:"#e2e8f0"}}>{v??"-"}</div></div>))}</div></div>}
       </div>}
       {/* Course Characteristic Radar from CSV */}
-      {courseRadarData&&<div style={S.section}><h3 style={S.h3}>📈 Course SG Profile</h3>
-        <CourseRadar data={courseRadarData} courseName={courseMatch?.course||"Course"}/>
+      {courseSGData&&<div style={S.section}><h3 style={S.h3}>📈 Course SG Difficulty Profile</h3>
+        <CourseSGProfile data={courseSGData} courseName={courseMatch?.course||"Course"}/>
       </div>}
       {similarCourses.length>0&&<div style={S.section}><h3 style={S.h3}>🔗 Top 10 Similar Courses</h3>
         <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Course</th><th style={S.th}>Sim%</th><th style={S.th}>Par</th><th style={S.th}>Yards</th><th style={S.th}>SG Putt</th><th style={S.th}>SG App</th><th style={S.th}>SG OTT</th></tr></thead><tbody>
           {similarCourses.map((c,i)=>(<tr key={c.course} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{c.course}</td><td style={{...S.td,fontWeight:700,color:c.sim>0.95?"#22c55e":"#22d3ee"}}>{(c.sim*100).toFixed(1)}%</td><td style={S.td}>{c.data.par}</td><td style={S.td}>{c.data.yardage}</td><td style={S.td}>{c.data.putt_sg?.toFixed(3)}</td><td style={S.td}>{c.data.app_sg?.toFixed(3)}</td><td style={S.td}>{c.data.ott_sg?.toFixed(3)}</td></tr>))}
         </tbody></table></div></div>}
       {/* Historical Weights Fetch */}
-      {courseCSV&&<div style={S.section}><h3 style={S.h3}>📊 Historical Weight Analysis</h3>
-        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:10,flexWrap:"wrap"}}>
-          {!eventList&&<span style={{fontSize:11,color:"#f59e0b"}}>⚠ Load Event List on Setup tab</span>}
-          {eventList&&<select value={courseHistEventId?courseHistEventId+"|"+courseHistYear:""} onChange={e=>handleEventSelect(e.target.value,setCourseHistEventId,setCourseHistYear)} style={{...S.inp,maxWidth:400}}><option value="">Select tournament...</option>{eventList.map((ev,i)=><option key={i} value={(ev.event_id||"")+"|"+(ev.calendar_year||"")}>{ev.event_name||ev.event_id} — {ev.calendar_year}</option>)}</select>}
-          {eventList&&<button onClick={fetchCourseHist} disabled={courseHistLoading||!courseHistEventId} style={{...S.btnP,opacity:courseHistLoading||!courseHistEventId?0.5:1}}>{courseHistLoading?"⏳ Loading...":"Analyze Course"}</button>}
-        </div>
-        {courseHistStatus&&<div style={{fontSize:11,color:courseHistStatus.startsWith("✓")?"#22c55e":"#94a3b8",marginBottom:10}}>{courseHistStatus}</div>}
-      </div>}
+      {/* Historical Rounds Paste Workflow */}
+      <div style={S.section}><h3 style={S.h3}>📊 Historical Rounds Data</h3>
+        <div style={{fontSize:10,color:"#64748b",marginBottom:8}}>Paste historical rounds JSON from DataGolf. Each paste accumulates — paste one year at a time. Used for Historical Optimal Weights and AV Basket Fit.</div>
+        {eventList&&<div style={{marginBottom:8}}>
+          <select value={histEventId} onChange={e=>setHistEventId(e.target.value)} style={{...S.inp,maxWidth:400,marginBottom:6}}><option value="">Select event for URL helper...</option>{eventList.map((ev,i)=><option key={i} value={ev.event_id||""}>{fmtEventLabel(ev)}</option>)}</select>
+          {histEventId&&apiKey&&<div style={{display:"flex",gap:4,flexWrap:"wrap"}}>{[2026,2025,2024,2023,2022,2021].map(yr=><button key={yr} onClick={()=>window.open(DG_BASE+"/historical-raw-data/rounds?tour=pga&event_id="+histEventId+"&year="+yr+"&file_format=json&key="+apiKey,"_blank")} style={{...S.btnSm,fontSize:9,background:"#1e293b",color:"#94a3b8"}}>{yr} ↗</button>)}</div>}
+          {histEventId&&!apiKey&&<div style={{fontSize:10,color:"#f59e0b"}}>Save DG API key on Setup tab for URL buttons.</div>}
+        </div>}
+        {!eventList&&<div style={{fontSize:10,color:"#f59e0b",marginBottom:6}}>Load Event List on Setup tab for URL helper buttons.</div>}
+        <div style={{position:"relative"}}><textarea value={histPasteText} onChange={e=>setHistPasteText(e.target.value)} rows={3} placeholder="Paste DataGolf historical-raw-data/rounds JSON here..." style={{width:"100%",padding:"9px 11px",fontSize:11,fontFamily:"'JetBrains Mono',monospace",background:"#1e293b",color:"#e2e8f0",border:"1px solid #334155",borderRadius:5,outline:"none",resize:"vertical",boxSizing:"border-box"}}/>
+          {histPasteText.trim()&&<button onClick={processHistPaste} style={{position:"absolute",bottom:8,right:8,padding:"4px 10px",fontSize:10,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:3,cursor:"pointer"}}>Process</button>}</div>
+        <div style={{display:"flex",gap:6,marginTop:6,alignItems:"center"}}>{histPasteLog.length>0&&<button onClick={clearHistPaste} style={{...S.btnSm,fontSize:9,background:"#7f1d1d",color:"#fca5a5"}}>Clear All Pasted Data</button>}
+          {(sGet("histRounds")||[]).length>0&&<span style={{fontSize:10,color:"#22c55e"}}>{(sGet("histRounds")||[]).length} total rounds loaded</span>}</div>
+        {histPasteLog.length>0&&<div style={{marginTop:6,display:"flex",flexDirection:"column",gap:3}}>{histPasteLog.map((l,i)=>(<div key={i} style={{fontSize:10,color:l.ok?"#4ade80":"#fca5a5"}}>{l.msg}</div>))}</div>}
+      </div>
       {/* Course Fit — DG + AV Basket */}
       {players.length>0&&<div style={S.section}><h3 style={S.h3}>🎯 Course Fit — Top 15</h3>
         <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player</th><th style={S.th}>DG Fit</th><th style={S.th}>DG Hx</th><th style={{...S.th,color:"#f59e0b"}}>AV Basket</th><th style={{...S.th,color:"#f59e0b",fontSize:7}}>Rnds</th><th style={S.th}>Combined</th></tr></thead><tbody>
@@ -476,7 +456,7 @@ function App(){
             </tbody></table></div>
             {hwAggregate&&<button onClick={applyOptimal} style={{...S.btnSm,marginTop:8,background:"#22c55e"}}>Apply Optimal Weights →</button>}
           </div>}
-          {histWeightsStatus&&!histWeights&&<div style={{fontSize:11,color:"#94a3b8",marginBottom:10}}>{histWeightsStatus}</div>}
+          {!histWeights&&<div style={{fontSize:11,color:"#94a3b8",marginBottom:10}}>Paste historical rounds on Course tab to generate optimal weights.</div>}
 
           <h2 style={S.h2}>SG Weights <span style={{fontSize:10,color:"#64748b",fontWeight:400}}>(sum to 100%)</span></h2>
           <div style={{fontSize:10,color:"#94a3b8",marginBottom:12,padding:"7px 11px",background:"#0f172a",borderRadius:4,borderLeft:"3px solid #22d3ee"}}>SENSITIVITY ×{SENSITIVITY}</div>
@@ -540,7 +520,8 @@ function App(){
       <div style={S.section}><h3 style={S.h3}>Select Simulation</h3><select value={gradingSim?.id||""} onChange={e=>{const h=hist.find(x=>x.id===+e.target.value);setGradingSim(h||null);}} style={{...S.inp,maxWidth:500,marginBottom:10}}><option value="">Choose...</option>{hist.map(h=><option key={h.id} value={h.id}>{h.t} — {new Date(h.date).toLocaleDateString()} — {h.n?.toLocaleString()} sims</option>)}</select></div>
       <div style={S.section}><h3 style={S.h3}>Fetch Results</h3><div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}>
         {!eventList&&<span style={{fontSize:11,color:"#f59e0b"}}>⚠ Load Event List on Setup tab</span>}
-        {eventList&&<select value={gradeEventId?gradeEventId+"|"+gradeYear:""} onChange={e=>handleEventSelect(e.target.value,setGradeEventId,setGradeYear)} style={{...S.inp,maxWidth:400}}><option value="">Select tournament...</option>{eventList.map((ev,i)=><option key={i} value={(ev.event_id||"")+"|"+(ev.calendar_year||"")}>{ev.event_name||ev.event_id} — {ev.calendar_year}</option>)}</select>}
+        {eventList&&<select value={gradeEventId||""} onChange={e=>{const eid=e.target.value;setGradeEventId(eid);if(!gradeYear)setGradeYear(String(new Date().getFullYear()));}} style={{...S.inp,maxWidth:400}}><option value="">Select tournament...</option>{eventList.map((ev,i)=><option key={i} value={ev.event_id||""}>{fmtEventLabel(ev)}</option>)}</select>}
+        {gradeEventId&&<input type="number" value={gradeYear} onChange={e=>setGradeYear(e.target.value)} style={{...S.inp,flex:"none",width:70,textAlign:"center"}} title="Year to fetch"/>}
         {eventList&&<button onClick={fetchGradeResults} disabled={gradeLoading||!gradeEventId} style={{...S.btnP,opacity:gradeLoading?0.5:1}}>{gradeLoading?"⏳":"Fetch"}</button>}</div>
         {gradeStatus&&<div style={{fontSize:11,color:gradeStatus.startsWith("✓")?"#22c55e":"#94a3b8"}}>{gradeStatus}</div>}</div>
       {gradingSim&&gradeResults&&(()=>{const simMap={};gradingSim.top30?.forEach(p=>simMap[p.id||p.n]=p);const matched=gradeResults.filter(r=>simMap[r.pid]||simMap[r.name]).map(r=>{const sp=simMap[r.pid]||simMap[r.name];return{name:r.name,finish:r.finish,simWin:sp?.w||0,simT5:sp?.t5||0,simT10:sp?.t10||0};}).sort((a,b)=>a.finish-b.finish);
