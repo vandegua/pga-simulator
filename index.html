@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PGA Tournament Simulator v4.8</title>
+<title>PGA Tournament Simulator v4.9</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
@@ -161,7 +161,7 @@ function PlayerCard({player:p,n,bankroll,kellyFrac}){
 }
 
 /* ══════════════════════════════════ */
-/* ══════════  MAIN APP V4.7 ═══════ */
+/* ══════════  MAIN APP V4.9 ═══════ */
 /* ══════════════════════════════════ */
 function App(){
   const [tab,setTab]=useState("setup");const [subTab,setSubTab]=useState("sim_results");
@@ -192,6 +192,7 @@ function App(){
   const [gradingSim,setGradingSim]=useState(null);const [gradeEventId,setGradeEventId]=useState("");const [gradeYear,setGradeYear]=useState(String(new Date().getFullYear()));
   const [gradeLoading,setGradeLoading]=useState(false);const [gradeStatus,setGradeStatus]=useState("");
   const [gradeResults,setGradeResults]=useState(null);const [gradeCorr,setGradeCorr]=useState(null);
+  const [gradePasteText,setGradePasteText]=useState("");
 
   useEffect(()=>{const k=sGet("dg_key");if(k){setApiKey(k);setApiKeyInp(k);}const p=sGet("presets");if(p)setPresets(p);const h=sGet("hist");if(h)setHist(h);const sg=sGet("sgW");if(sg)setSgW(sg);const cx=sGet("ctxW");if(cx)setCtxW(prev=>({...prev,...cx}));const b=sGet("bankroll");if(b)setBankroll(b);const kf=sGet("kf");if(kf!=null)setKellyFrac(kf);const csv=sGet("courseCSV");if(csv)setCourseCSV(csv);const el=sGet("eventList");if(el)setEventList(el);const hr=sGet("histRounds");if(hr&&hr.length>0){/* rebuild weights from persisted rounds */const byY={};hr.forEach(r=>{const y=r._pasteYear||r.year||"?";if(!byY[y])byY[y]=[];byY[y].push(r);});const yd=[];Object.entries(byY).sort((a,b)=>b[0]-a[0]).forEach(([y,yR])=>{if(yR.length>10){const o=computeOptimalWeights(yR);if(o)yd.push({year:y,opt:o,rounds:yR.length});}});if(yd.length)setHistWeights(yd.slice(0,5));}},[]);
   useEffect(()=>{sSet("sgW",sgW);},[sgW]);useEffect(()=>{sSet("ctxW",ctxW);},[ctxW]);
@@ -245,7 +246,7 @@ function App(){
     const {results,allScores:scores}=runSim(players,w,simCount);setSimRes(results);setAllScores(scores);
     if(scores&&ds.matchupPairs.length>0)setH2hData(computeH2H(scores,players,ds.matchupPairs.slice(0,300)));else setH2hData(null);
     setSimRunning(false);setTab("results");setSubTab("sim_results");
-    const e={id:Date.now(),date:new Date().toISOString(),t:tourney?.name,n:simCount,sg:{...sgW},cx:{...ctxW},top30:results.slice().sort((a,b)=>b.sim_win-a.sim_win).slice(0,30).map(p=>({id:p.id,n:p.name,w:p.sim_win,t5:p.sim_top5,t10:p.sim_top10,t20:p.sim_top20,mc:p.sim_make_cut}))};
+    const e={id:Date.now(),date:new Date().toISOString(),t:tourney?.name,n:simCount,sg:{...sgW},cx:{...ctxW},top30:results.slice().sort((a,b)=>b.sim_win-a.sim_win).slice(0,30).map(p=>({id:p.id,n:p.name,w:p.sim_win,t5:p.sim_top5,t10:p.sim_top10,t20:p.sim_top20,mc:p.sim_make_cut})),allPlayers:results.slice().sort((a,b)=>b.sim_win-a.sim_win).slice(0,150).map(p=>({id:p.id,n:p.name,w:p.sim_win,t5:p.sim_top5,t10:p.sim_top10,t20:p.sim_top20,mc:p.sim_make_cut,af:p.avg_finish}))};
     const h=[e,...hist].slice(0,20);setHist(h);sSet("hist",h);
   },[players,sgW,ctxW,simCount,tourney,hist,ds.matchupPairs]);
 
@@ -324,6 +325,22 @@ function App(){
       setGradeStatus("✓ "+results.length+" players");
     }catch(e){setGradeStatus("Error: "+e.message+(e.message.includes("proxies")?" — try again in a minute or check your API key.":""));}setGradeLoading(false);};
 
+  /* ── Process pasted grading results JSON ── */
+  const processGradePaste=()=>{if(!gradePasteText.trim())return;setGradeResults(null);setGradeCorr(null);
+    try{const raw=JSON.parse(gradePasteText.trim());const rounds=parseRoundsData(raw);
+      if(!rounds.length){setGradeStatus("No round data found in pasted JSON.");return;}
+      const byP={};rounds.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;if(!byP[pid])byP[pid]={pid,name:r.player_name,finish:999,rounds:0,sg_ott:0,sg_app:0,sg_arg:0,sg_putt:0};const p=byP[pid];p.rounds++;p.sg_ott+=(r.sg_ott||0);p.sg_app+=(r.sg_app||0);p.sg_arg+=(r.sg_arg||0);p.sg_putt+=(r.sg_putt||0);const fn=parseInt(String(r.fin_text).replace(/\D/g,""))||999;p.finish=Math.min(p.finish,fn);});
+      const results=Object.values(byP).filter(r=>r.rounds>0).sort((a,b)=>a.finish-b.finish);setGradeResults(results);
+      const valid=results.filter(r=>r.rounds>=3&&r.finish<900);
+      if(valid.length>=10){const fin=valid.map(r=>r.finish);const corrs=SG_CATS.map(c=>({...c,corr:spearmanCorr(valid.map(r=>r[c.k]),fin)}));const abs=corrs.map(c=>Math.abs(c.corr));const tot=abs.reduce((a,b)=>a+b,0)||1;setGradeCorr({corrs:corrs.map((c,i)=>({...c,suggestedPct:Math.round(abs[i]/tot*100)})),n:valid.length});}
+      setGradeStatus("✓ "+results.length+" players (pasted)");setGradePasteText("");
+    }catch(e){setGradeStatus("Paste error: "+e.message);}};
+
+  /* ── Name normalization for grading match ── */
+  const normName=n=>(n||"").toLowerCase().replace(/[^a-z]/g,"");
+  const lastFirst=n=>{const parts=(n||"").split(/[\s,]+/).filter(Boolean);return parts.length>=2?normName(parts[parts.length-1]+parts[0]):normName(n);};
+  const buildGradeMap=(simPlayers)=>{const m={};(simPlayers||[]).forEach(p=>{m[p.id]=p;m[normName(p.n)]=p;m[lastFirst(p.n)]=p;});return m;};
+
   /* ── Apply optimal weights + context multipliers ── */
   const applyOptimal=()=>{if(!hwAggregate)return;const ott=hwAggregate.sg_ott||25;const d=Math.round(ott*OTT_DIST_RATIO);const a=ott-d;const app=hwAggregate.sg_app||25;const arg=hwAggregate.sg_arg||25;const putt=hwAggregate.sg_putt||25;const tot=d+a+app+arg+putt;const adj=100-tot;setSgW({dist:d,acc:a,app:app+adj,arg,putt});};
 
@@ -335,7 +352,7 @@ function App(){
   const hasOdds=dSt.odds.length>0;
   const tSort=(col,def="desc")=>setSort(s=>s.col===col?{...s,dir:s.dir==="desc"?"asc":"desc"}:{col,dir:def});
   const toggleCmp=(hid)=>setCompareItems(ci=>ci.includes(hid)?ci.filter(x=>x!==hid):ci.length>=2?[ci[1],hid]:[...ci,hid]);
-  const compareData=useMemo(()=>{if(compareItems.length<2)return null;const [a,b]=[hist.find(h=>h.id===compareItems[0]),hist.find(h=>h.id===compareItems[1])];if(!a||!b)return null;const bMap={};b.top30?.forEach(p=>bMap[p.id]=p);return{a,b,rows:(a.top30||[]).map(p=>{const bp=bMap[p.id]||{};return{name:p.n,aW:p.w,bW:bp.w||0,dW:(p.w||0)-(bp.w||0)};}).sort((a,b)=>b.aW-a.aW)};},[compareItems,hist]);
+  const compareData=useMemo(()=>{if(compareItems.length<2)return null;const [a,b]=[hist.find(h=>h.id===compareItems[0]),hist.find(h=>h.id===compareItems[1])];if(!a||!b)return null;const aP=a.allPlayers||a.top30||[];const bP=b.allPlayers||b.top30||[];const bMap={};bP.forEach(p=>bMap[p.id]=p);return{a,b,rows:aP.map(p=>{const bp=bMap[p.id]||{};return{name:p.n,aW:p.w,bW:bp.w||0,dW:(p.w||0)-(bp.w||0)};}).sort((a,b)=>b.aW-a.aW)};},[compareItems,hist]);
   const csvRes=()=>{if(!sorted.length)return;downloadCSV(sorted.map(p=>({Name:p.name,Win:pFmt(p.sim_win),Top5:pFmt(p.sim_top5),Top10:pFmt(p.sim_top10),Top20:pFmt(p.sim_top20),Cut:pFmt(p.sim_make_cut),AvgPos:p.avg_finish?.toFixed(1)})),"results.csv");};
   const csvEV=()=>{if(!evData.length)return;downloadCSV(evData.filter(p=>MARKETS.some(m=>p["ev_"+m]!=null)).map(p=>({Name:p.name,...Object.fromEntries(MARKETS.flatMap(m=>[["EV_"+m,evFmt(p["ev_"+m])],["Kelly$_"+m,p["kelly_"+m]?.toFixed(2)||""]]))})),"ev.csv");};
   const handleCSVUpload=(e)=>{const file=e.target.files?.[0];if(!file)return;const reader=new FileReader();reader.onload=(ev)=>{const data=parseCSV(ev.target.result);if(data.length>0){setCourseCSV(data);sSet("courseCSV",data);}};reader.readAsText(file);};
@@ -351,7 +368,7 @@ function App(){
   const RESULT_SUBS=[["sim_results","Results"],["ev","EV Analysis"],["matchups","Matchups"],["history","History"]];
 
   return(<div style={S.root}>
-    <div style={S.header}><div style={S.hL}><div style={S.logo}>◆</div><div><h1 style={S.title}>PGA Tournament Simulator <span style={{fontSize:9,color:"#22d3ee",background:"#164e63",padding:"1px 6px",borderRadius:3}}>v4.8</span></h1><div style={S.sub}>{tourney?tourney.name+" · "+tourney.course:"Course Intel · Field Analysis · Monte Carlo · Grading"}</div></div></div>
+    <div style={S.header}><div style={S.hL}><div style={S.logo}>◆</div><div><h1 style={S.title}>PGA Tournament Simulator <span style={{fontSize:9,color:"#22d3ee",background:"#164e63",padding:"1px 6px",borderRadius:3}}>v4.9</span></h1><div style={S.sub}>{tourney?tourney.name+" · "+tourney.course:"Course Intel · Field Analysis · Monte Carlo · Grading"}</div></div></div>
       <div style={S.badges}>{players.length>0&&<span style={S.badge}>{players.length} players</span>}{simRes&&<span style={S.badge}>{simCount.toLocaleString()} sims</span>}{courseCSV&&<span style={{...S.badge,color:"#a78bfa",borderColor:"#7c3aed"}}>{courseCSV.length} courses</span>}</div></div>
     <div style={S.tabs}>{TABS.map(([id,lb,en])=>(<button key={id} disabled={!en} onClick={()=>{setTab(id);if(id==="results")setSubTab("sim_results");}} style={{...S.tab,...(tab===id?S.tabOn:{}),...(!en?S.tabOff:{})}}>{lb}</button>))}</div>
     {tab==="results"&&<div style={S.subTabs}>{RESULT_SUBS.map(([id,lb])=>(<button key={id} onClick={()=>setSubTab(id)} style={{...S.subTab,...(subTab===id?S.subTabOn:{})}}>{lb}</button>))}</div>}
@@ -510,42 +527,107 @@ function App(){
         {!hist.length&&<div style={S.empty}>No simulations yet.</div>}
         {hist.map(h=>{const isSel=compareItems.includes(h.id);const si=compareItems.indexOf(h.id);return(<div key={h.id} style={{...S.hCard,borderLeft:"3px solid "+(isSel?"#22d3ee":"#1e293b")}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}><span style={{fontSize:13,fontWeight:700,color:"#e2e8f0"}}>{h.t||"Tournament"}</span><div style={{display:"flex",gap:4}}><button onClick={()=>toggleCmp(h.id)} style={{...S.btnSm,fontSize:9,background:isSel?"#1e3a5f":"#1e293b",color:isSel?"#22d3ee":"#94a3b8"}}>{isSel?"✓ "+(si===0?"A":"B"):"Compare"}</button><button onClick={()=>{setSgW(h.sg);setCtxW(prev=>({...prev,...h.cx}));setTab("simulation");}} style={{...S.btnSm,fontSize:9}}>↺ Reload</button></div></div>
           <div style={{fontSize:10,color:"#64748b"}}>{new Date(h.date).toLocaleString()} · {h.n?.toLocaleString()} sims</div>
-          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:4}}>{h.top30?.slice(0,5).map((t,j)=>(<span key={j} style={S.hP}>{j+1}. {t.n} ({(t.w*100).toFixed(1)}%)</span>))}</div></div>);})}
+          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:4}}>{(h.allPlayers||h.top30||[]).slice(0,5).map((t,j)=>(<span key={j} style={S.hP}>{j+1}. {t.n} ({(t.w*100).toFixed(1)}%)</span>))}</div></div>);})}
       </div>}
     </div>}
 
     {/* ═══ GRADING ═══ */}
     {tab==="grading"&&<div style={S.panel}>
       <h2 style={S.h2}>Post-Tournament Grading</h2>
-      <div style={S.section}><h3 style={S.h3}>Select Simulation</h3><select value={gradingSim?.id||""} onChange={e=>{const h=hist.find(x=>x.id===+e.target.value);setGradingSim(h||null);}} style={{...S.inp,maxWidth:500,marginBottom:10}}><option value="">Choose...</option>{hist.map(h=><option key={h.id} value={h.id}>{h.t} — {new Date(h.date).toLocaleDateString()} — {h.n?.toLocaleString()} sims</option>)}</select></div>
-      <div style={S.section}><h3 style={S.h3}>Fetch Results</h3><div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}>
-        {!eventList&&<span style={{fontSize:11,color:"#f59e0b"}}>⚠ Load Event List on Setup tab</span>}
-        {eventList&&<select value={gradeEventId||""} onChange={e=>{const eid=e.target.value;setGradeEventId(eid);if(!gradeYear)setGradeYear(String(new Date().getFullYear()));}} style={{...S.inp,maxWidth:400}}><option value="">Select tournament...</option>{eventList.map((ev,i)=><option key={i} value={ev.event_id||""}>{fmtEventLabel(ev)}</option>)}</select>}
-        {gradeEventId&&<input type="number" value={gradeYear} onChange={e=>setGradeYear(e.target.value)} style={{...S.inp,flex:"none",width:70,textAlign:"center"}} title="Year to fetch"/>}
-        {eventList&&<button onClick={fetchGradeResults} disabled={gradeLoading||!gradeEventId} style={{...S.btnP,opacity:gradeLoading?0.5:1}}>{gradeLoading?"⏳":"Fetch"}</button>}</div>
-        {gradeStatus&&<div style={{fontSize:11,color:gradeStatus.startsWith("✓")?"#22c55e":"#94a3b8"}}>{gradeStatus}</div>}</div>
-      {gradingSim&&gradeResults&&(()=>{const simMap={};gradingSim.top30?.forEach(p=>simMap[p.id||p.n]=p);const matched=gradeResults.filter(r=>simMap[r.pid]||simMap[r.name]).map(r=>{const sp=simMap[r.pid]||simMap[r.name];return{name:r.name,finish:r.finish,simWin:sp?.w||0,simT5:sp?.t5||0,simT10:sp?.t10||0};}).sort((a,b)=>a.finish-b.finish);
+      <div style={S.section}><h3 style={S.h3}>Select Simulation</h3><select value={gradingSim?.id||""} onChange={e=>{const h=hist.find(x=>x.id===+e.target.value);setGradingSim(h||null);}} style={{...S.inp,maxWidth:500,marginBottom:10}}><option value="">Choose...</option>{hist.map(h=><option key={h.id} value={h.id}>{h.t} — {new Date(h.date).toLocaleDateString()} — {h.n?.toLocaleString()} sims{h.allPlayers?" · "+h.allPlayers.length+"p":" · "+((h.top30||[]).length)+"p"}</option>)}</select>
+        {gradingSim&&<div style={{fontSize:10,color:"#64748b",marginTop:4}}>Players stored: <b style={{color:"#e2e8f0"}}>{(gradingSim.allPlayers||gradingSim.top30||[]).length}</b>{!gradingSim.allPlayers&&<span style={{color:"#f59e0b"}}> (legacy sim — only top 30 saved. Re-run sim for full field grading.)</span>}</div>}
+      </div>
+
+      <div style={S.section}><h3 style={S.h3}>Fetch Results</h3>
+        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}>
+          {!eventList&&<span style={{fontSize:11,color:"#f59e0b"}}>⚠ Load Event List on Setup tab</span>}
+          {eventList&&<select value={gradeEventId||""} onChange={e=>{const eid=e.target.value;setGradeEventId(eid);if(!gradeYear)setGradeYear(String(new Date().getFullYear()));}} style={{...S.inp,maxWidth:400}}><option value="">Select tournament...</option>{eventList.map((ev,i)=><option key={i} value={ev.event_id||""}>{fmtEventLabel(ev)}</option>)}</select>}
+          {gradeEventId&&<input type="number" value={gradeYear} onChange={e=>setGradeYear(e.target.value)} style={{...S.inp,flex:"none",width:70,textAlign:"center"}} title="Year to fetch"/>}
+          {eventList&&<button onClick={fetchGradeResults} disabled={gradeLoading||!gradeEventId} style={{...S.btnP,opacity:gradeLoading?0.5:1}}>{gradeLoading?"⏳":"Fetch"}</button>}
+          {gradeEventId&&apiKey&&<button onClick={()=>window.open(DG_BASE+"/historical-raw-data/rounds?tour=pga&event_id="+gradeEventId+"&year="+gradeYear+"&file_format=json&key="+apiKey,"_blank")} style={{...S.btnSm,background:"#1e293b",color:"#94a3b8"}}>Open ↗</button>}
+        </div>
+        {gradeStatus&&<div style={{fontSize:11,color:gradeStatus.startsWith("✓")?"#22c55e":gradeStatus.startsWith("Error")?"#fca5a5":"#94a3b8"}}>{gradeStatus}</div>}
+
+        {/* Paste fallback */}
+        {!gradeResults&&<div style={{marginTop:12}}>
+          <div style={{fontSize:10,color:"#64748b",marginBottom:4}}>If Fetch fails: open the URL above ↗, copy the JSON, and paste it here.</div>
+          <div style={{position:"relative"}}><textarea value={gradePasteText} onChange={e=>setGradePasteText(e.target.value)} rows={3} placeholder="Paste DataGolf historical-raw-data/rounds JSON here..." style={{width:"100%",padding:"9px 11px",fontSize:11,fontFamily:"'JetBrains Mono',monospace",background:"#1e293b",color:"#e2e8f0",border:"1px solid #334155",borderRadius:5,outline:"none",resize:"vertical",boxSizing:"border-box"}}/>
+            {gradePasteText.trim()&&<button onClick={processGradePaste} style={{position:"absolute",bottom:8,right:8,padding:"4px 10px",fontSize:10,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:3,cursor:"pointer"}}>Process</button>}</div>
+        </div>}
+        {gradeResults&&<button onClick={()=>{setGradeResults(null);setGradeCorr(null);setGradeStatus("");}} style={{...S.btnSm,fontSize:9,background:"#7f1d1d",color:"#fca5a5",marginTop:6}}>Clear Results</button>}
+      </div>
+
+      {/* ── Projection vs Actual ── */}
+      {gradingSim&&gradeResults&&(()=>{
+        const simPlayers=gradingSim.allPlayers||gradingSim.top30||[];
+        const simMap=buildGradeMap(simPlayers);
+        /* Build sim rank map */
+        const simRanked=[...simPlayers].sort((a,b)=>b.w-a.w);
+        const simRankMap={};simRanked.forEach((p,i)=>{simRankMap[p.id]=i+1;simRankMap[normName(p.n)]=i+1;simRankMap[lastFirst(p.n)]=i+1;});
+
+        const matched=gradeResults.filter(r=>simMap[r.pid]||simMap[normName(r.name)]||simMap[lastFirst(r.name)]).map(r=>{
+          const sp=simMap[r.pid]||simMap[normName(r.name)]||simMap[lastFirst(r.name)];
+          const simRank=simRankMap[sp.id]||simRankMap[normName(sp.n)]||"—";
+          return{name:r.name,finish:r.finish,simWin:sp?.w||0,simT5:sp?.t5||0,simT10:sp?.t10||0,simT20:sp?.t20||0,simMC:sp?.mc||0,simAvg:sp?.af||null,simRank};
+        }).sort((a,b)=>a.finish-b.finish);
+
+        const unmatched=gradeResults.filter(r=>!simMap[r.pid]&&!simMap[normName(r.name)]&&!simMap[lastFirst(r.name)]&&r.finish<=20).sort((a,b)=>a.finish-b.finish);
+
         const corr=matched.length>=5?spearmanCorr(matched.map(m=>m.simWin),matched.map(m=>m.finish)):null;
-        const best=matched.filter(m=>m.simWin>0&&m.finish<=10).sort((a,b)=>b.simWin-a.simWin).slice(0,3);
-        const worst=matched.filter(m=>m.simWin>0.01&&m.finish>50).slice(0,3);
+        const rankCorr=matched.length>=5?spearmanCorr(matched.map(m=>m.simRank==="—"?999:m.simRank),matched.map(m=>m.finish)):null;
+        const best=matched.filter(m=>m.simWin>0.005&&m.finish<=10).sort((a,b)=>b.simWin-a.simWin).slice(0,5);
+        const worst=matched.filter(m=>m.simWin>0.01&&m.finish>40).sort((a,b)=>b.simWin-a.simWin).slice(0,5);
+        const surprises=matched.filter(m=>m.finish<=10&&m.simWin<0.005).sort((a,b)=>a.finish-b.finish).slice(0,5);
+        const busts=matched.filter(m=>m.simRank!=="—"&&m.simRank<=15&&m.finish>40).sort((a,b)=>a.simRank-b.simRank).slice(0,5);
+
         return<div style={S.section}><h3 style={S.h3}>📊 Projection vs Actual</h3>
-          {corr!=null&&<div style={{padding:10,background:"#0f172a",borderRadius:6,marginBottom:12,display:"flex",gap:16,flexWrap:"wrap"}}><div><div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Rank Correlation</div><div style={{fontSize:20,fontWeight:700,color:corr<-0.3?"#22c55e":corr<-0.1?"#f59e0b":"#ef4444"}}>{corr.toFixed(3)}</div></div>
-            {best.length>0&&<div><div style={{fontSize:9,color:"#22c55e",marginBottom:3}}>BEST CALLS</div>{best.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1"}}>{m.name}: {pFmtS(m.simWin)} → #{m.finish}</div>)}</div>}
-            {worst.length>0&&<div><div style={{fontSize:9,color:"#ef4444",marginBottom:3}}>WORST CALLS</div>{worst.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1"}}>{m.name}: {pFmtS(m.simWin)} → #{m.finish}</div>)}</div>}</div>}
-          <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>Finish</th><th style={{...S.th,textAlign:"left"}}>Player</th><th style={S.th}>Sim Win%</th><th style={S.th}>Sim T5%</th><th style={S.th}>Sim T10%</th></tr></thead><tbody>
-            {matched.slice(0,50).map((m,i)=>(<tr key={m.name} style={i%2?S.trO:S.trE}><td style={{...S.td,fontWeight:700,color:m.finish<=5?"#22c55e":m.finish<=20?"#22d3ee":"#94a3b8"}}>{m.finish}</td><td style={S.tdN}>{m.name}</td><td style={S.td}>{pFmtS(m.simWin)}</td><td style={S.td}>{pFmtS(m.simT5)}</td><td style={S.td}>{pFmtS(m.simT10)}</td></tr>))}
-          </tbody></table></div></div>;})()}
-      {gradeCorr&&<div style={S.section}><h3 style={S.h3}>🎯 What Mattered</h3>
+          {/* Score Cards */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:12,marginBottom:16}}>
+            {corr!=null&&<div style={{padding:12,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Win% → Finish Correlation</div><div style={{fontSize:22,fontWeight:700,color:corr<-0.3?"#22c55e":corr<-0.1?"#f59e0b":"#ef4444"}}>{corr.toFixed(3)}</div><div style={{fontSize:9,color:"#475569"}}>{corr<-0.4?"Excellent model":corr<-0.25?"Good model":corr<-0.1?"Okay — room to improve":"Weak — review weights"}</div></div>}
+            {rankCorr!=null&&<div style={{padding:12,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Sim Rank → Finish Rank</div><div style={{fontSize:22,fontWeight:700,color:rankCorr>0.3?"#22c55e":rankCorr>0.1?"#f59e0b":"#ef4444"}}>{rankCorr.toFixed(3)}</div><div style={{fontSize:9,color:"#475569"}}>{matched.length} matched</div></div>}
+            <div style={{padding:12,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Coverage</div><div style={{fontSize:22,fontWeight:700,color:"#e2e8f0"}}>{matched.length}<span style={{fontSize:12,color:"#475569"}}>/{gradeResults.length}</span></div><div style={{fontSize:9,color:"#475569"}}>{simPlayers.length} in sim · {unmatched.length} top-20 unmatched</div></div>
+          </div>
+
+          {/* Best/Worst/Surprise/Bust panels */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:12,marginBottom:16}}>
+            {best.length>0&&<div style={{padding:10,background:"#0a2e1a",border:"1px solid #166534",borderRadius:6}}><div style={{fontSize:9,fontWeight:700,color:"#22c55e",marginBottom:4,textTransform:"uppercase"}}>Best Calls ({best.length})</div>{best.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1",marginBottom:2}}>{m.name}: <span style={{color:"#22c55e"}}>Win {pFmtS(m.simWin)}</span> → <b>#{m.finish}</b></div>)}</div>}
+            {worst.length>0&&<div style={{padding:10,background:"#1c1117",border:"1px solid #7f1d1d",borderRadius:6}}><div style={{fontSize:9,fontWeight:700,color:"#ef4444",marginBottom:4,textTransform:"uppercase"}}>Worst Calls ({worst.length})</div>{worst.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1",marginBottom:2}}>{m.name}: <span style={{color:"#ef4444"}}>Win {pFmtS(m.simWin)}</span> → #{m.finish}</div>)}</div>}
+            {surprises.length>0&&<div style={{padding:10,background:"#1a1a0e",border:"1px solid #854d0e",borderRadius:6}}><div style={{fontSize:9,fontWeight:700,color:"#f59e0b",marginBottom:4,textTransform:"uppercase"}}>Surprises (Top 10, Low Sim%)</div>{surprises.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1",marginBottom:2}}>{m.name}: Win {pFmtS(m.simWin)} → <b style={{color:"#f59e0b"}}>#{m.finish}</b></div>)}</div>}
+            {busts.length>0&&<div style={{padding:10,background:"#1c1117",border:"1px solid #7f1d1d",borderRadius:6}}><div style={{fontSize:9,fontWeight:700,color:"#f87171",marginBottom:4,textTransform:"uppercase"}}>Busts (Top 15 Sim, Finish 40+)</div>{busts.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1",marginBottom:2}}>{m.name}: <span style={{color:"#f87171"}}>Sim #{m.simRank}</span> → #{m.finish}</div>)}</div>}
+          </div>
+
+          {/* Unmatched actual top finishers */}
+          {unmatched.length>0&&<div style={{padding:10,background:"#0f172a",border:"1px solid #334155",borderRadius:6,marginBottom:16}}><div style={{fontSize:9,fontWeight:700,color:"#f59e0b",marginBottom:4,textTransform:"uppercase"}}>Unmatched Top-20 Finishers (not in sim)</div><div style={{display:"flex",flexWrap:"wrap",gap:4}}>{unmatched.map(m=><span key={m.name} style={{fontSize:10,padding:"2px 6px",background:"#1e293b",borderRadius:3,color:"#cbd5e1"}}>#{m.finish} {m.name}</span>)}</div></div>}
+
+          {/* Full table */}
+          <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>Finish</th><th style={{...S.th,textAlign:"left"}}>Player</th><th style={{...S.th,color:"#22d3ee"}}>Sim Rank</th><th style={S.th}>Sim Win%</th><th style={S.th}>Sim T5%</th><th style={S.th}>Sim T10%</th><th style={S.th}>Sim T20%</th><th style={S.th}>Sim Cut%</th>{simPlayers[0]?.af!=null&&<th style={S.th}>Sim Avg</th>}</tr></thead><tbody>
+            {matched.slice(0,showAll?999:80).map((m,i)=>{const rankDelta=m.simRank!=="—"?m.simRank-m.finish:null;return(<tr key={m.name} style={i%2?S.trO:S.trE}><td style={{...S.td,fontWeight:700,color:m.finish<=5?"#22c55e":m.finish<=20?"#22d3ee":"#94a3b8"}}>{m.finish}</td><td style={S.tdN}>{m.name}</td><td style={{...S.td,color:rankDelta!=null?(Math.abs(rankDelta)<=5?"#22c55e":Math.abs(rankDelta)<=15?"#f59e0b":"#ef4444"):"#475569"}}>{m.simRank}{rankDelta!=null&&<span style={{fontSize:8,marginLeft:3,color:rankDelta>0?"#ef4444":"#22c55e"}}>{rankDelta>0?"↓"+rankDelta:rankDelta<0?"↑"+Math.abs(rankDelta):""}</span>}</td><td style={S.td}>{pFmtS(m.simWin)}</td><td style={S.td}>{pFmtS(m.simT5)}</td><td style={S.td}>{pFmtS(m.simT10)}</td><td style={S.td}>{pFmtS(m.simT20)}</td><td style={S.td}>{pFmtS(m.simMC)}</td>{simPlayers[0]?.af!=null&&<td style={S.td}>{m.simAvg?.toFixed(1)||"—"}</td>}</tr>);})}
+          </tbody></table></div>
+          {!showAll&&matched.length>80&&<button onClick={()=>setShowAll(true)} style={{...S.btnSm,marginTop:8}}>Show All {matched.length}</button>}
+        </div>;})()}
+
+      {/* ── What Actually Mattered ── */}
+      {gradeCorr&&<div style={S.section}><h3 style={S.h3}>🎯 What Actually Mattered</h3>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:18}}>
           <div style={{padding:14,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:12,fontWeight:700,color:"#f59e0b",marginBottom:8}}>Actual SG Importance (n={gradeCorr.n})</div>
-            {gradeCorr.corrs.map(c=>(<div key={c.k} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid #1e293b"}}><span style={{fontSize:11,color:"#cbd5e1"}}>{c.l}</span><div><span style={{fontSize:13,fontWeight:700,color:"#f59e0b"}}>{c.suggestedPct}%</span><span style={{fontSize:9,color:"#475569",marginLeft:6}}>r={c.corr?.toFixed(2)}</span></div></div>))}
+            {gradeCorr.corrs.map(c=>{const yourW=gradingSim?gradingSim.sg?.[c.sk==="dist"?"dist":c.sk==="app"?"app":c.sk==="arg"?"arg":"putt"]||0:null;const delta=yourW!=null?c.suggestedPct-yourW:null;return(<div key={c.k} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:"1px solid #1e293b"}}><span style={{fontSize:11,color:"#cbd5e1"}}>{c.l}</span><div style={{display:"flex",gap:8,alignItems:"center"}}><span style={{fontSize:13,fontWeight:700,color:"#f59e0b"}}>{c.suggestedPct}%</span>{yourW!=null&&<span style={{fontSize:10,color:Math.abs(delta)<=5?"#22c55e":Math.abs(delta)<=12?"#f59e0b":"#ef4444"}}>you: {yourW}% ({delta>0?"+":""}{delta})</span>}<span style={{fontSize:9,color:"#475569"}}>r={c.corr?.toFixed(2)}</span></div></div>);})}
             {gradingSim&&<div style={{marginTop:12,fontSize:10,color:"#64748b"}}><b>Your weights:</b> D:{gradingSim.sg?.dist}% Ac:{gradingSim.sg?.acc}% Ap:{gradingSim.sg?.app}% AR:{gradingSim.sg?.arg}% P:{gradingSim.sg?.putt}%</div>}
           </div>
           <div style={{fontSize:11,color:"#64748b",lineHeight:1.6,padding:"14px 0"}}>
             <p>These weights show which SG categories most strongly correlated with finish position at this event.</p>
-            <p style={{marginTop:8}}>A higher % means that category was more predictive of who finished well. Compare against the weights you used in your simulation to see where your model was over/under-weighted.</p>
+            <p style={{marginTop:8}}>Compare the <b style={{color:"#f59e0b"}}>optimal %</b> against <b>your weights</b>. Green = close match, red = significant gap. Use this to calibrate weights for similar courses.</p>
+            {gradingSim&&<button onClick={()=>{if(!gradeCorr)return;const corrs=gradeCorr.corrs;const abs=corrs.map(c=>Math.abs(c.corr));const tot=abs.reduce((a,b)=>a+b,0)||1;const ott=Math.round(abs[0]/tot*100);setSgW({dist:Math.round(ott*OTT_DIST_RATIO),acc:ott-Math.round(ott*OTT_DIST_RATIO),app:corrs[1]?.suggestedPct||25,arg:corrs[2]?.suggestedPct||25,putt:corrs[3]?.suggestedPct||25});setTab("simulation");}} style={{...S.btnSm,marginTop:12,background:"#f59e0b",color:"#0a0e17"}}>Apply These Weights →</button>}
           </div>
-        </div></div>}
+        </div>
+      </div>}
+
+      {/* ── localStorage Backup ── */}
+      <div style={S.section}><h3 style={S.h3}>💾 Data Backup</h3>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}><button onClick={()=>{const data={};for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k.startsWith("pga3_"))data[k]=localStorage.getItem(k);}const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([JSON.stringify(data)],{type:"application/json"}));a.download="pga3_backup_"+new Date().toISOString().slice(0,10)+".json";a.click();}} style={{...S.btnSm,background:"#1e293b",color:"#94a3b8"}}>⬇ Export All Data</button>
+          <label style={{...S.btnSm,background:"#1e293b",color:"#94a3b8",cursor:"pointer"}}>⬆ Import Backup<input type="file" accept=".json" style={{display:"none"}} onChange={e=>{const file=e.target.files?.[0];if(!file)return;const reader=new FileReader();reader.onload=ev=>{try{const data=JSON.parse(ev.target.result);let count=0;Object.entries(data).forEach(([k,v])=>{if(k.startsWith("pga3_")){localStorage.setItem(k,v);count++;}});alert("Restored "+count+" keys. Refresh to apply.");location.reload();}catch(err){alert("Invalid backup: "+err.message);}};reader.readAsText(file);}}/></label>
+        </div>
+        <div style={{fontSize:9,color:"#475569",marginTop:4}}>Export saves all simulation history, weights, presets, and course data.</div>
+      </div>
     </div>}
   </div>);
 }
