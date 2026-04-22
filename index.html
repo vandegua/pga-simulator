@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PGA Tournament Simulator v5.0</title>
+<title>PGA Tournament Simulator v5.1</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
@@ -25,6 +25,8 @@ const {useState,useEffect,useCallback,useMemo}=React;
 const SENSITIVITY=4;
 const DG_BASE="https://feeds.datagolf.com";
 const WEATHER_KEY="f9747827ca9b4e7aa0b175947261303";
+/* WMO weather code → human-readable text (Open-Meteo standard) */
+const wmoCodeToText=(c)=>{const m={0:"Clear",1:"Mainly clear",2:"Partly cloudy",3:"Overcast",45:"Fog",48:"Rime fog",51:"Light drizzle",53:"Drizzle",55:"Heavy drizzle",56:"Freezing drizzle",57:"Heavy freezing drizzle",61:"Light rain",63:"Rain",65:"Heavy rain",66:"Freezing rain",67:"Heavy freezing rain",71:"Light snow",73:"Snow",75:"Heavy snow",77:"Snow grains",80:"Light showers",81:"Showers",82:"Violent showers",85:"Snow showers",86:"Heavy snow showers",95:"Thunderstorm",96:"Thunderstorm w/ hail",99:"Thunderstorm w/ heavy hail"};return m[c]||"—";};
 const DG_KEY_HIST="c741a29a2fdc66f8ff76ea573847";
 const SIM_COUNTS=[1000,5000,10000,25000,50000];
 const MARKETS=["win","top_5","top_10","top_20","make_cut"];
@@ -66,6 +68,13 @@ const qualifiesBet=(sp,n,impliedDevig,minEV)=>{if(sp==null||impliedDevig==null)r
 const downloadCSV=(rows,fname)=>{if(!rows.length)return;const hdrs=Object.keys(rows[0]);const csv=[hdrs.join(","),...rows.map(r=>hdrs.map(h=>{const v=r[h];return typeof v==="string"&&v.includes(",")?"\""+v+"\"":v??""}).join(","))].join("\n");const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download=fname;a.click();};
 const sGet=k=>{try{const v=localStorage.getItem("pga3_"+k);return v?JSON.parse(v):null;}catch{return null;}};
 const sSet=(k,v)=>{try{localStorage.setItem("pga3_"+k,JSON.stringify(v));}catch{}};
+/* ── Event-scoped histRounds: key by normalized event name ── */
+const evtKey=(name)=>(name||"_unscoped").toLowerCase().replace(/[^a-z0-9]/g,"").slice(0,40)||"_unscoped";
+const getHistRoundsForEvent=(evtName)=>{const all=sGet("histRoundsByEvent")||{};const k=evtKey(evtName);return all[k]||[];};
+const setHistRoundsForEvent=(evtName,rounds)=>{const all=sGet("histRoundsByEvent")||{};const k=evtKey(evtName);if(!rounds||!rounds.length)delete all[k];else all[k]=rounds;sSet("histRoundsByEvent",all);};
+const getAllHistRoundsBuckets=()=>{const all=sGet("histRoundsByEvent")||{};return Object.entries(all).map(([k,rounds])=>({k,rounds,count:rounds.length,eventName:rounds[0]?._eventName||k}));};
+/* One-time migration: if legacy histRounds exists, move it to _unscoped bucket */
+(function migrateHistRounds(){try{const legacy=sGet("histRounds");if(legacy&&Array.isArray(legacy)&&legacy.length>0){const existing=sGet("histRoundsByEvent")||{};if(!existing._legacy){existing._legacy=legacy.map(r=>({...r,_eventName:"_legacy (pre-v5.1)"}));sSet("histRoundsByEvent",existing);}localStorage.removeItem("pga3_histRounds");}}catch{}})();
 const fmtEventLabel=(ev)=>{const name=ev.event_name||ev.event_id||"Unknown";const sd=ev.start_date||ev.date;if(sd){try{const d=new Date(sd+"T12:00:00");if(!isNaN(d)){return name+" "+d.toLocaleDateString("en",{month:"short"})+" "+d.getFullYear();}}catch{}}return name+" — "+(ev.calendar_year||"");};
 const parseCSV=(text)=>{const lines=text.split(/\r?\n/).filter(l=>l.trim());if(lines.length<2)return[];const hdr=lines[0].split(",").map(h=>h.replace(/"/g,"").trim());return lines.slice(1).map(line=>{const vals=[];let cur="",inQ=false;for(let i=0;i<line.length;i++){const c=line[i];if(c==='"'){inQ=!inQ;}else if(c===","&&!inQ){vals.push(cur);cur="";}else{cur+=c;}}vals.push(cur);const obj={};hdr.forEach((h,i)=>{const v=vals[i]?.trim();obj[h]=isNaN(v)||v===""?v:parseFloat(v);});return obj;});};
 
@@ -223,7 +232,26 @@ function App(){
   const [gradeResults,setGradeResults]=useState(null);const [gradeCorr,setGradeCorr]=useState(null);
   const [gradePasteText,setGradePasteText]=useState("");
 
-  useEffect(()=>{const k=sGet("dg_key");if(k){setApiKey(k);setApiKeyInp(k);}const p=sGet("presets");if(p)setPresets(p);const h=sGet("hist");if(h)setHist(h);const sg=sGet("sgW");if(sg)setSgW(sg);const cx=sGet("ctxW");if(cx)setCtxW(prev=>({...prev,...cx}));const b=sGet("bankroll");if(b)setBankroll(b);const kf=sGet("kf");if(kf!=null)setKellyFrac(kf);const sig=sGet("sigma");if(sig!=null&&sig>=1&&sig<=5)setSigma(sig);const me=sGet("minEV");if(me)setMinEV(prev=>({...prev,...me}));const om=sGet("oddsMode");if(om)setOddsMode(om);const dv=sGet("devigOn");if(dv!=null)setDevigOn(dv);const ci=sGet("useCIFilter");if(ci!=null)setUseCIFilter(ci);const csv=sGet("courseCSV");if(csv)setCourseCSV(csv);const el=sGet("eventList");if(el)setEventList(el);const hr=sGet("histRounds");if(hr&&hr.length>0){const byY={};hr.forEach(r=>{const y=r._pasteYear||r.year||"?";if(!byY[y])byY[y]=[];byY[y].push(r);});const yd=[];Object.entries(byY).sort((a,b)=>b[0]-a[0]).forEach(([y,yR])=>{if(yR.length>10){const o=computeOptimalWeights(yR);if(o)yd.push({year:y,opt:o,rounds:yR.length});}});if(yd.length)setHistWeights(yd.slice(0,5));}},[]);
+  useEffect(()=>{const k=sGet("dg_key");if(k){setApiKey(k);setApiKeyInp(k);}const p=sGet("presets");if(p)setPresets(p);const h=sGet("hist");if(h)setHist(h);const sg=sGet("sgW");if(sg)setSgW(sg);const cx=sGet("ctxW");if(cx)setCtxW(prev=>({...prev,...cx}));const b=sGet("bankroll");if(b)setBankroll(b);const kf=sGet("kf");if(kf!=null)setKellyFrac(kf);const sig=sGet("sigma");if(sig!=null&&sig>=1&&sig<=5)setSigma(sig);const me=sGet("minEV");if(me)setMinEV(prev=>({...prev,...me}));const om=sGet("oddsMode");if(om)setOddsMode(om);const dv=sGet("devigOn");if(dv!=null)setDevigOn(dv);const ci=sGet("useCIFilter");if(ci!=null)setUseCIFilter(ci);const csv=sGet("courseCSV");if(csv)setCourseCSV(csv);const el=sGet("eventList");if(el)setEventList(el);/* histRounds now hydrated via tourney effect below */},[]);
+
+  /* When tourney changes, rebuild histWeights & basket adjustments from this event's bucket */
+  useEffect(()=>{const evtName=tourney?.name;const hr=getHistRoundsForEvent(evtName);
+    if(!hr||hr.length===0){setHistWeights(null);setPlayerSimCoursePerf(null);setPlayers(prev=>prev.length?prev.map(pl=>({...pl,similar_course_adj:0,basket_rounds:0})):prev);return;}
+    const byY={};hr.forEach(r=>{const y=r._pasteYear||r.year||"?";if(!byY[y])byY[y]=[];byY[y].push(r);});
+    const yd=[];Object.entries(byY).sort((a,b)=>b[0]-a[0]).forEach(([y,yR])=>{if(yR.length>10){const o=computeOptimalWeights(yR);if(o)yd.push({year:y,opt:o,rounds:yR.length});}});
+    setHistWeights(yd.length?yd.slice(0,5):null);
+    /* Rebuild basket stats */
+    const pa={};hr.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;if(!pa[pid])pa[pid]={name:r.player_name,rounds:0,sg_total:0};pa[pid].rounds++;pa[pid].sg_total+=(r.sg_total||0);});
+    Object.values(pa).forEach(p=>{if(p.rounds>0)p.sg_total/=p.rounds;});
+    setPlayerSimCoursePerf(pa);
+    /* Apply basket_fit to current players (normalized to DG fit scale) */
+    setPlayers(prev=>{if(!prev.length)return prev;const qualified=Object.values(pa).filter(p=>p.rounds>=MIN_BASKET_ROUNDS);if(qualified.length===0)return prev.map(pl=>({...pl,similar_course_adj:0,basket_rounds:pa[pl.id]?.rounds||pa[pl.name]?.rounds||0}));
+      const rawVals=qualified.map(p=>p.sg_total);const rawMean=rawVals.reduce((a,b)=>a+b,0)/rawVals.length;const rawStd=rawVals.length>1?Math.sqrt(rawVals.reduce((s,v)=>s+(v-rawMean)**2,0)/rawVals.length):1;
+      const fitVals=prev.map(p=>p.course_fit_adj||0).filter(v=>Math.abs(v)>0.001);const fitMean=fitVals.length?fitVals.reduce((a,b)=>a+b,0)/fitVals.length:0;const fitStd=fitVals.length>1?Math.sqrt(fitVals.reduce((s,v)=>s+(v-fitMean)**2,0)/fitVals.length):0.15;
+      Object.values(pa).forEach(p=>{p.basket_fit=p.rounds>=MIN_BASKET_ROUNDS&&rawStd>0.001?((p.sg_total-rawMean)/rawStd)*fitStd+fitMean:0;});
+      return prev.map(pl=>{const perf=pa[pl.id]||pa[pl.name];return{...pl,similar_course_adj:perf&&perf.rounds>=MIN_BASKET_ROUNDS?perf.basket_fit:0,basket_rounds:perf?perf.rounds:0};});
+    });
+  },[tourney?.name]);
   useEffect(()=>{sSet("sgW",sgW);},[sgW]);useEffect(()=>{sSet("ctxW",ctxW);},[ctxW]);
   useEffect(()=>{sSet("bankroll",bankroll);},[bankroll]);useEffect(()=>{sSet("kf",kellyFrac);},[kellyFrac]);
   useEffect(()=>{sSet("sigma",sigma);},[sigma]);
@@ -297,12 +325,46 @@ function App(){
   const doSim=useCallback(async()=>{if(!players.length)return;setSimRunning(true);await new Promise(r=>setTimeout(r,50));
     const w={sg_dist:sgW.dist/100,sg_acc:sgW.acc/100,sg_app:sgW.app/100,sg_arg:sgW.arg/100,sg_putt:sgW.putt/100,course_history:ctxW.ch/100,course_fit:ctxW.cf/100,recent_form:ctxW.rf/100,similar_course:ctxW.sc/100};
     const {results,allScores:scores}=runSim(players,w,simCount,sigma);setSimRes(results);setAllScores(scores);
-    if(scores&&ds.matchupPairs.length>0)setH2hData(computeH2H(scores,players,ds.matchupPairs.slice(0,300)));else setH2hData(null);
+    const h2h=scores&&ds.matchupPairs.length>0?computeH2H(scores,players,ds.matchupPairs.slice(0,300)):null;
+    if(h2h)setH2hData(h2h);else setH2hData(null);
     setSimRunning(false);setTab("results");setSubTab("sim_results");
     const sortedRes=results.slice().sort((a,b)=>b.sim_win-a.sim_win);
-    const e={id:Date.now(),date:new Date().toISOString(),t:tourney?.name,n:simCount,sg:{...sgW},cx:{...ctxW},sigma,top30:sortedRes.slice(0,30).map(p=>({id:p.id,n:p.name,w:p.sim_win,t5:p.sim_top5,t10:p.sim_top10,t20:p.sim_top20,mc:p.sim_make_cut})),allPlayers:sortedRes.slice(0,150).map(p=>({id:p.id,n:p.name,w:p.sim_win,t5:p.sim_top5,t10:p.sim_top10,t20:p.sim_top20,mc:p.sim_make_cut,af:p.avg_finish}))};
+
+    /* ── Snapshot qualified EV bets (outrights) ── */
+    const smk={win:"sim_win",top_5:"sim_top5",top_10:"sim_top10",top_20:"sim_top20",make_cut:"sim_make_cut"};
+    const oddsKey=oddsMode==="best"?"bestOdds":oddsMode==="median"?"median":"dkOdds";
+    const bets=[];
+    /* Per-market devig sum */
+    const devigSumByMkt={};MARKETS.forEach(m=>{devigSumByMkt[m]=results.reduce((s,p)=>{const od=p.playerOdds?.[m];return s+((od?.[oddsKey]>1)?decToImp(od[oddsKey]):0);},0);});
+    results.forEach(p=>{MARKETS.forEach(m=>{const od=p.playerOdds?.[m];const dec=od?.[oddsKey];if(!od||!dec||dec<=1)return;
+      const sp=p[smk[m]]||0;const imp=decToImp(dec);const sum=devigSumByMkt[m];const impDevig=(devigOn&&sum>0)?imp/sum:imp;
+      const ci=ci95(sp,simCount);const spLow=Math.max(0,sp-ci);const edgeLow=spLow-impDevig;const threshold=minEV[m]||0;
+      const qualified=useCIFilter?(edgeLow>=threshold):((sp-impDevig)>=threshold);
+      if(!qualified)return;
+      const kelly=kellyBet(sp,dec,kellyFrac,bankroll);
+      bets.push({mkt:m,pid:p.id,name:p.name,simProb:sp,ciLow:spLow,oddsDec:dec,book:oddsMode==="dk"?"DK":oddsMode==="best"?(od.bestBook||""):"MED",kelly,impDevig,evDevig:sp-impDevig,evTrue:sp*dec-1,minEVUsed:threshold,category:"outright"});
+    });});
+    /* ── Snapshot qualified matchup bets ── */
+    if(h2h&&ds.matchupPairs.length>0){
+      ds.matchupPairs.slice(0,300).forEach(m=>{const s1Raw=h2h[m.id1+"_"+m.id2];if(s1Raw==null)return;const p_tie=m.p_tie||0;
+        const s1=s1Raw*(1-p_tie),s2=(1-s1Raw)*(1-p_tie);
+        const dec1=oddsMode==="best"?m.best1:oddsMode==="median"?m.med1:m.dk1;
+        const dec2=oddsMode==="best"?m.best2:oddsMode==="median"?m.med2:m.dk2;
+        const book1=oddsMode==="best"?m.best1Book:oddsMode==="median"?"MED":"DK";
+        const book2=oddsMode==="best"?m.best2Book:oddsMode==="median"?"MED":"DK";
+        const i1=dec1>1?decToImp(dec1):0,i2=dec2>1?decToImp(dec2):0;const iSum=i1+i2;
+        const i1Dev=devigOn&&iSum>0?i1/iSum*(1-p_tie):i1;const i2Dev=devigOn&&iSum>0?i2/iSum*(1-p_tie):i2;
+        const ci=ci95(s1,simCount);const s1Low=Math.max(0,s1-ci),s2Low=Math.max(0,s2-ci);const thr=minEV.matchup||0.03;
+        const q1=useCIFilter?(s1Low-i1Dev>=thr):((s1-i1Dev)>=thr);
+        const q2=useCIFilter?(s2Low-i2Dev>=thr):((s2-i2Dev)>=thr);
+        if(q1&&dec1>1){bets.push({mkt:"matchup",pid:m.id1,name:m.name1,opponent:m.name2,opponentId:m.id2,simProb:s1,oddsDec:dec1,book:book1,kelly:kellyBet(s1,dec1,kellyFrac,bankroll),evDevig:s1-i1Dev,evTrue:s1*(dec1-1)-(1-s1-p_tie),pTie:p_tie,minEVUsed:thr,category:"matchup"});}
+        if(q2&&dec2>1){bets.push({mkt:"matchup",pid:m.id2,name:m.name2,opponent:m.name1,opponentId:m.id1,simProb:s2,oddsDec:dec2,book:book2,kelly:kellyBet(s2,dec2,kellyFrac,bankroll),evDevig:s2-i2Dev,evTrue:s2*(dec2-1)-(1-s2-p_tie),pTie:p_tie,minEVUsed:thr,category:"matchup"});}
+      });
+    }
+
+    const e={id:Date.now(),date:new Date().toISOString(),t:tourney?.name,n:simCount,sg:{...sgW},cx:{...ctxW},sigma,settings:{oddsMode,devigOn,useCIFilter,minEV:{...minEV},kellyFrac,bankroll},bets,top30:sortedRes.slice(0,30).map(p=>({id:p.id,n:p.name,w:p.sim_win,t5:p.sim_top5,t10:p.sim_top10,t20:p.sim_top20,mc:p.sim_make_cut})),allPlayers:sortedRes.slice(0,150).map(p=>({id:p.id,n:p.name,w:p.sim_win,t5:p.sim_top5,t10:p.sim_top10,t20:p.sim_top20,mc:p.sim_make_cut,af:p.avg_finish}))};
     const h=[e,...hist].slice(0,20);setHist(h);sSet("hist",h);
-  },[players,sgW,ctxW,simCount,tourney,hist,ds.matchupPairs,sigma]);
+  },[players,sgW,ctxW,simCount,tourney,hist,ds.matchupPairs,sigma,oddsMode,devigOn,useCIFilter,minEV,kellyFrac,bankroll]);
 
   const dgFetchRetry=async(path,params)=>{const apiK=apiKey||DG_KEY_HIST;const p={...params,key:params.key||apiK};for(let pi=0;pi<PROXIES.length;pi++){try{return await dgFetch(path,p,pi);}catch{}}throw new Error("All proxies failed");};
   const parseRoundsData=(d,extraFields={})=>{const raw=d?.scores||findArr(d);if(!raw?.length)return[];const rounds=[];raw.forEach(p=>{const finText=p.fin_text||p.finish_position||p.position||p.fin||"";let foundNested=false;for(let r=1;r<=4;r++){const rd=p["round_"+r];if(rd&&(rd.sg_app!==undefined||rd.sg_ott!==undefined)){foundNested=true;rounds.push({...rd,dg_id:p.dg_id,player_name:p.player_name,fin_text:finText,...extraFields});}}if(!foundNested&&(p.sg_app!==undefined||p.sg_ott!==undefined)){rounds.push({sg_ott:p.sg_ott||0,sg_app:p.sg_app||0,sg_arg:p.sg_arg||0,sg_putt:p.sg_putt||0,sg_total:p.sg_total||0,dg_id:p.dg_id,player_name:p.player_name,fin_text:finText,...extraFields});}});return rounds;};
@@ -322,20 +384,21 @@ function App(){
       if(!rounds.length){setHistPasteLog(l=>[...l,{ok:false,msg:"No rounds found in pasted data."}]);return;}
       /* Detect year from data */
       const yr=rounds[0]?.year||raw?.calendar_year||raw?.season||"?";
-      /* Accumulate with existing pasted rounds */
-      const existing=sGet("histRounds")||[];
-      const combined=[...existing,...rounds.map(r=>({...r,_pasteYear:yr}))];
-      sSet("histRounds",combined);
-      /* Rebuild weights from accumulated rounds */
+      /* Event-scoped store: use current tourney name */
+      const curEvtName=tourney?.name||"_unscoped";
+      const existing=getHistRoundsForEvent(curEvtName);
+      const tagged=rounds.map(r=>({...r,_pasteYear:yr,_eventName:curEvtName}));
+      const combined=[...existing,...tagged];
+      setHistRoundsForEvent(curEvtName,combined);
+      /* Rebuild weights from this event's rounds only */
       const byYear={};combined.forEach(r=>{const y=r._pasteYear||r.year||"?";if(!byYear[y])byYear[y]=[];byYear[y].push(r);});
       const yearData=[];Object.entries(byYear).sort((a,b)=>b[0]-a[0]).forEach(([y,yRounds])=>{
         if(yRounds.length>10){const opt=computeOptimalWeights(yRounds);if(opt)yearData.push({year:y,opt,rounds:yRounds.length});}
       });
-      if(yearData.length)setHistWeights(yearData.slice(0,5));
-      /* Rebuild basket: aggregate per player across all pasted rounds */
+      if(yearData.length)setHistWeights(yearData.slice(0,5));else setHistWeights(null);
+      /* Rebuild basket from this event's rounds only */
       const pa={};combined.forEach(r=>{const pid=r.dg_id||r.player_name;if(!pid)return;if(!pa[pid])pa[pid]={name:r.player_name,rounds:0,sg_total:0};pa[pid].rounds++;pa[pid].sg_total+=(r.sg_total||0);});
       Object.values(pa).forEach(p=>{if(p.rounds>0)p.sg_total/=p.rounds;});
-      /* Normalize to DG fit scale */
       const qualified=Object.values(pa).filter(p=>p.rounds>=MIN_BASKET_ROUNDS);
       if(qualified.length>0&&players.length>0){
         const rawVals=qualified.map(p=>p.sg_total);
@@ -348,11 +411,13 @@ function App(){
         setPlayerSimCoursePerf(pa);
         setPlayers(prev=>prev.map(pl=>{const perf=pa[pl.id]||pa[pl.name];return{...pl,similar_course_adj:perf&&perf.rounds>=MIN_BASKET_ROUNDS?perf.basket_fit:0,basket_rounds:perf?perf.rounds:0};}));
       }
-      setHistPasteLog(l=>[...l,{ok:true,msg:"✓ Year "+yr+": "+rounds.length+" rounds ("+combined.length+" total accumulated)"}]);
+      setHistPasteLog(l=>[...l,{ok:true,msg:"✓ "+curEvtName+" · Year "+yr+": "+rounds.length+" rounds ("+combined.length+" total for this event)"}]);
       setHistPasteText("");
     }catch(e){setHistPasteLog(l=>[...l,{ok:false,msg:"JSON error: "+e.message}]);}
   };
-  const clearHistPaste=()=>{sSet("histRounds",null);setHistWeights(null);setHistPasteLog([]);setPlayerSimCoursePerf(null);
+  const clearHistPaste=()=>{const curEvtName=tourney?.name||"_unscoped";setHistRoundsForEvent(curEvtName,null);setHistWeights(null);setHistPasteLog([]);setPlayerSimCoursePerf(null);
+    setPlayers(prev=>prev.map(pl=>({...pl,similar_course_adj:0,basket_rounds:0})));};
+  const clearAllHistPaste=()=>{sSet("histRoundsByEvent",{});setHistWeights(null);setHistPasteLog([]);setPlayerSimCoursePerf(null);
     setPlayers(prev=>prev.map(pl=>({...pl,similar_course_adj:0,basket_rounds:0})));};
 
   const hwAggregate=useMemo(()=>{if(!histWeights)return null;
@@ -360,13 +425,59 @@ function App(){
     const tot=Object.values(avg).reduce((a,b)=>a+b,0)||1;SG_CATS.forEach(c=>{avg[c.k]=Math.round(avg[c.k]/tot*100);});return avg;
   },[histWeights]);
 
-  const fetchWeather=async()=>{const city=weatherCity.trim()||tourney?.city||tourney?.course||"";if(!city){setWeatherData({error:"Enter a city"});return;}setWeatherLoading(true);try{const r=await fetch("https://api.weatherapi.com/v1/forecast.json?key="+WEATHER_KEY+"&q="+encodeURIComponent(city)+"&days=7&aqi=no");const d=await r.json();setWeatherData(d.error?{error:d.error.message}:d);}catch(e){setWeatherData({error:e.message});}setWeatherLoading(false);};
-  const weatherInsights=useMemo(()=>{if(!weatherData?.forecast)return null;const days=weatherData.forecast.forecastday;const avgWind=days.reduce((s,d)=>s+(d.day.maxwind_mph||0),0)/days.length;const avgRain=days.reduce((s,d)=>s+(d.day.daily_chance_of_rain||0),0)/days.length;const avgTemp=days.reduce((s,d)=>s+(d.day.avgtemp_f||0),0)/days.length;const maxWind=Math.max(...days.map(d=>d.day.maxwind_mph||0));const totalPrecip=days.reduce((s,d)=>s+(d.day.totalprecip_in||0),0);const tips=[];
-    if(avgWind>=20)tips.push({icon:"💨",text:"Very windy (avg "+avgWind.toFixed(0)+"mph). Boost Driving Accuracy and Approach."});else if(avgWind>=15)tips.push({icon:"💨",text:"Moderate wind (avg "+avgWind.toFixed(0)+"mph). Ball strikers have an edge."});else if(avgWind<8)tips.push({icon:"🏌",text:"Calm conditions (avg "+avgWind.toFixed(0)+"mph). Distance matters more."});
-    if(totalPrecip>=1.5)tips.push({icon:"🌧",text:"Significant rain ("+totalPrecip.toFixed(1)+"in). Soft greens reward approach accuracy."});else if(avgRain>=40)tips.push({icon:"🌧",text:"Rain likely ("+avgRain.toFixed(0)+"%). Course plays longer/softer."});
-    if(totalPrecip<0.1&&avgTemp>=80)tips.push({icon:"☀️",text:"Hot and dry ("+avgTemp.toFixed(0)+"°F). Firm/fast — short game premium."});
-    if(maxWind>=25)tips.push({icon:"⚠️",text:"Gusts to "+maxWind.toFixed(0)+"mph on at least one day. Scrambling matters."});
-    return tips.length?{tips}:null;
+  /* ── Weather via Open-Meteo (free, unlimited, no key, 7+ days). Two-step: geocode → forecast ── */
+  const fetchWeather=async()=>{const city=weatherCity.trim()||tourney?.city||tourney?.course||"";if(!city){setWeatherData({error:"Enter a city"});return;}setWeatherLoading(true);
+    try{
+      /* 1. Geocode */
+      const gr=await fetch("https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&format=json&name="+encodeURIComponent(city));
+      const gd=await gr.json();
+      if(!gd.results||!gd.results.length){setWeatherData({error:"Location not found: "+city});setWeatherLoading(false);return;}
+      const loc=gd.results[0];const {latitude:lat,longitude:lon,name:resolvedName,country,admin1}=loc;
+      /* 2. Forecast — 7 days, imperial units. Daily: max/avg temp, precip, max wind, precip prob */
+      const url="https://api.open-meteo.com/v1/forecast?latitude="+lat+"&longitude="+lon+"&daily=temperature_2m_max,temperature_2m_min,apparent_temperature_max,precipitation_sum,precipitation_probability_max,wind_speed_10m_max,wind_gusts_10m_max,weather_code&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&forecast_days=7";
+      const fr=await fetch(url);const fd=await fr.json();
+      if(fd.error){setWeatherData({error:fd.reason||"forecast error"});setWeatherLoading(false);return;}
+      /* Normalize to {forecast:{forecastday:[{date, day:{...}}]}} shape the UI already expects */
+      const daily=fd.daily;const days=daily.time.map((date,i)=>({
+        date,
+        day:{
+          maxtemp_f:daily.temperature_2m_max[i],
+          mintemp_f:daily.temperature_2m_min[i],
+          avgtemp_f:(daily.temperature_2m_max[i]+daily.temperature_2m_min[i])/2,
+          feelslike_f:daily.apparent_temperature_max[i],
+          totalprecip_in:daily.precipitation_sum[i]||0,
+          daily_chance_of_rain:daily.precipitation_probability_max[i]||0,
+          maxwind_mph:daily.wind_speed_10m_max[i]||0,
+          maxgust_mph:daily.wind_gusts_10m_max[i]||0,
+          condition:{text:wmoCodeToText(daily.weather_code[i])}
+        }
+      }));
+      setWeatherData({location:{name:resolvedName,region:admin1||"",country:country||""},forecast:{forecastday:days}});
+    }catch(e){setWeatherData({error:e.message});}
+    setWeatherLoading(false);
+  };
+  const weatherInsights=useMemo(()=>{if(!weatherData?.forecast)return null;const days=weatherData.forecast.forecastday;if(!days.length)return null;
+    const avgWind=days.reduce((s,d)=>s+(d.day.maxwind_mph||0),0)/days.length;
+    const avgRain=days.reduce((s,d)=>s+(d.day.daily_chance_of_rain||0),0)/days.length;
+    const avgTemp=days.reduce((s,d)=>s+(d.day.avgtemp_f||0),0)/days.length;
+    const maxWind=Math.max(...days.map(d=>d.day.maxwind_mph||0));
+    const maxGust=Math.max(...days.map(d=>d.day.maxgust_mph||d.day.maxwind_mph||0));
+    const totalPrecip=days.reduce((s,d)=>s+(d.day.totalprecip_in||0),0);
+    const tips=[];
+    /* Wind tips */
+    if(avgWind>=20)tips.push({icon:"💨",text:"Very windy (avg "+avgWind.toFixed(0)+"mph across week). Strongly favors OTT accuracy and ball strikers. Consider boosting Driving Accuracy and Approach weights.",cats:["acc","app"],dir:"up"});
+    else if(avgWind>=15)tips.push({icon:"💨",text:"Moderate wind (avg "+avgWind.toFixed(0)+"mph). Good ball strikers with controlled trajectories have an edge. Slight bump to Approach weight.",cats:["app","acc"],dir:"up"});
+    else if(avgWind<8)tips.push({icon:"🏌",text:"Calm conditions (avg "+avgWind.toFixed(0)+"mph). Low wind reduces OTT penalty — bombers can be more aggressive. Distance matters more.",cats:["dist"],dir:"up"});
+    /* Rain tips */
+    if(totalPrecip>=1.5)tips.push({icon:"🌧",text:"Significant rain expected ("+totalPrecip.toFixed(1)+"in total). Soft greens reward accurate approach play — ball stops where it lands. Putting becomes more predictable on slower greens.",cats:["app"],dir:"up"});
+    else if(avgRain>=40)tips.push({icon:"🌧",text:"Rain likely (avg "+avgRain.toFixed(0)+"% chance). Course plays longer and softer. Approach accuracy more valuable as greens hold.",cats:["app","dist"],dir:"up"});
+    /* Heat & firm */
+    if(totalPrecip<0.1&&avgTemp>=80)tips.push({icon:"☀️",text:"Hot and dry ("+avgTemp.toFixed(0)+"°F, minimal rain). Firm/fast conditions — premium on short game touch and putting feel. Course plays firmer.",cats:["putt","arg"],dir:"up"});
+    /* Gust warning */
+    if(maxGust>=25)tips.push({icon:"⚠️",text:"At least one day with gusts to "+maxGust.toFixed(0)+"mph. Expect high scoring that round — scrambling and around-green skills matter more on tough days.",cats:["arg"],dir:"up"});
+    /* Combo: wet + windy */
+    if(totalPrecip>=0.5&&avgWind>=15)tips.push({icon:"🌊",text:"Wet + windy combo. Full ball-striking week — Approach and OTT accuracy are king. Putting variance decreases on soft, slow greens.",cats:["app","acc"],dir:"up"});
+    return tips.length?{tips,avgWind,avgRain,avgTemp,totalPrecip,maxWind,maxGust,days:days.length}:{tips:[],avgWind,avgRain,avgTemp,totalPrecip,maxWind,maxGust,days:days.length};
   },[weatherData]);
 
   const fetchGradeResults=async()=>{if(!gradeEventId)return;setGradeLoading(true);setGradeStatus("Fetching...");setGradeResults(null);setGradeCorr(null);
@@ -395,6 +506,40 @@ function App(){
   const lastFirst=n=>{const parts=(n||"").split(/[\s,]+/).filter(Boolean);return parts.length>=2?normName(parts[parts.length-1]+parts[0]):normName(n);};
   const buildGradeMap=(simPlayers)=>{const m={};(simPlayers||[]).forEach(p=>{if(p.id)m[p.id]=p;if(p.n){m[normName(p.n)]=p;m[lastFirst(p.n)]=p;}});return m;};
   const gradeMatchPlayer=(r,simMap)=>simMap[r.pid]||simMap[normName(r.name)]||simMap[lastFirst(r.name)];
+
+  /* ── Grade bets against actual results ──
+     Outright: W if finish<=threshold, L otherwise. Push only on "WD" edge cases, void otherwise.
+     Make cut: W if player made cut (finish<900), L if "CUT" / finish>=900.
+     Matchup: W if bettee finished strictly better than opponent; Void if tied; L otherwise. */
+  const gradeBet=(bet,resultsByKey)=>{
+    const lookup=(pid,name)=>resultsByKey[pid]||resultsByKey[normName(name||"")]||resultsByKey[lastFirst(name||"")];
+    const r=lookup(bet.pid,bet.name);
+    if(!r)return{outcome:"NO_DATA",unitPL:0,kellyPL:0};
+    /* outright markets */
+    if(bet.category==="outright"){
+      const thresholds={win:1,top_5:5,top_10:10,top_20:20};
+      if(bet.mkt==="make_cut"){const madeCut=r.rounds>=3&&r.finish<900;const outcome=madeCut?"WIN":"LOSS";
+        return{outcome,unitPL:outcome==="WIN"?(bet.oddsDec-1):-1,kellyPL:outcome==="WIN"?bet.kelly*(bet.oddsDec-1):-bet.kelly};}
+      const thr=thresholds[bet.mkt];if(!thr)return{outcome:"UNKNOWN",unitPL:0,kellyPL:0};
+      if(r.finish>=900)return{outcome:"LOSS",unitPL:-1,kellyPL:-bet.kelly};/* missed cut = loss */
+      const won=r.finish<=thr;
+      return{outcome:won?"WIN":"LOSS",unitPL:won?(bet.oddsDec-1):-1,kellyPL:won?bet.kelly*(bet.oddsDec-1):-bet.kelly};
+    }
+    /* matchup */
+    if(bet.category==="matchup"){
+      const opp=lookup(bet.opponentId,bet.opponent);
+      if(!opp)return{outcome:"NO_OPP_DATA",unitPL:0,kellyPL:0};
+      /* Both missed cut: treat as tie → void (most books) */
+      const pMC=r.finish>=900,oMC=opp.finish>=900;
+      if(pMC&&oMC)return{outcome:"VOID",unitPL:0,kellyPL:0};
+      if(pMC&&!oMC)return{outcome:"LOSS",unitPL:-1,kellyPL:-bet.kelly};
+      if(!pMC&&oMC)return{outcome:"WIN",unitPL:bet.oddsDec-1,kellyPL:bet.kelly*(bet.oddsDec-1)};
+      if(r.finish<opp.finish)return{outcome:"WIN",unitPL:bet.oddsDec-1,kellyPL:bet.kelly*(bet.oddsDec-1)};
+      if(r.finish>opp.finish)return{outcome:"LOSS",unitPL:-1,kellyPL:-bet.kelly};
+      return{outcome:"VOID",unitPL:0,kellyPL:0};
+    }
+    return{outcome:"UNKNOWN",unitPL:0,kellyPL:0};
+  };
 
   /* ── Apply optimal weights + context multipliers ── */
   const applyOptimal=()=>{if(!hwAggregate)return;const ott=hwAggregate.sg_ott||25;const d=Math.round(ott*OTT_DIST_RATIO);const a=ott-d;const app=hwAggregate.sg_app||25;const arg=hwAggregate.sg_arg||25;const putt=hwAggregate.sg_putt||25;const tot=d+a+app+arg+putt;const adj=100-tot;setSgW({dist:d,acc:a,app:app+adj,arg,putt});};
@@ -472,7 +617,7 @@ function App(){
   const RESULT_SUBS=[["sim_results","Results"],["ev","EV Analysis"],["matchups","Matchups"],["history","History"]];
 
   return(<div style={S.root}>
-    <div style={S.header}><div style={S.hL}><div style={S.logo}>◆</div><div><h1 style={S.title}>PGA Tournament Simulator <span style={{fontSize:9,color:"#22d3ee",background:"#164e63",padding:"1px 6px",borderRadius:3}}>v5.0</span></h1><div style={S.sub}>{tourney?tourney.name+" · "+tourney.course:"Course Intel · Field Analysis · Monte Carlo · Grading"}</div></div></div>
+    <div style={S.header}><div style={S.hL}><div style={S.logo}>◆</div><div><h1 style={S.title}>PGA Tournament Simulator <span style={{fontSize:9,color:"#22d3ee",background:"#164e63",padding:"1px 6px",borderRadius:3}}>v5.1</span></h1><div style={S.sub}>{tourney?tourney.name+" · "+tourney.course:"Course Intel · Field Analysis · Monte Carlo · Grading"}</div></div></div>
       <div style={S.badges}>{players.length>0&&<span style={S.badge}>{players.length} players</span>}{simRes&&<span style={S.badge}>{simCount.toLocaleString()} sims</span>}{courseCSV&&<span style={{...S.badge,color:"#a78bfa",borderColor:"#7c3aed"}}>{courseCSV.length} courses</span>}</div></div>
     <div style={S.tabs}>{TABS.map(([id,lb,en])=>(<button key={id} disabled={!en} onClick={()=>{setTab(id);if(id==="results")setSubTab("sim_results");}} style={{...S.tab,...(tab===id?S.tabOn:{}),...(!en?S.tabOff:{})}}>{lb}</button>))}</div>
     {tab==="results"&&<div style={S.subTabs}>{RESULT_SUBS.map(([id,lb])=>(<button key={id} onClick={()=>setSubTab(id)} style={{...S.subTab,...(subTab===id?S.subTabOn:{})}}>{lb}</button>))}</div>}
@@ -524,8 +669,20 @@ function App(){
         {!eventList&&<div style={{fontSize:10,color:"#f59e0b",marginBottom:6}}>Load Event List on Setup tab for URL helper buttons.</div>}
         <div style={{position:"relative"}}><textarea value={histPasteText} onChange={e=>setHistPasteText(e.target.value)} rows={3} placeholder="Paste DataGolf historical-raw-data/rounds JSON here..." style={{width:"100%",padding:"9px 11px",fontSize:11,fontFamily:"'JetBrains Mono',monospace",background:"#1e293b",color:"#e2e8f0",border:"1px solid #334155",borderRadius:5,outline:"none",resize:"vertical",boxSizing:"border-box"}}/>
           {histPasteText.trim()&&<button onClick={processHistPaste} style={{position:"absolute",bottom:8,right:8,padding:"4px 10px",fontSize:10,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:3,cursor:"pointer"}}>Process</button>}</div>
-        <div style={{display:"flex",gap:6,marginTop:6,alignItems:"center"}}>{histPasteLog.length>0&&<button onClick={clearHistPaste} style={{...S.btnSm,fontSize:9,background:"#7f1d1d",color:"#fca5a5"}}>Clear All Pasted Data</button>}
-          {(sGet("histRounds")||[]).length>0&&<span style={{fontSize:10,color:"#22c55e"}}>{(sGet("histRounds")||[]).length} total rounds loaded</span>}</div>
+        {(()=>{const curEvtRounds=getHistRoundsForEvent(tourney?.name);const allBuckets=getAllHistRoundsBuckets();const totalRounds=allBuckets.reduce((s,b)=>s+b.count,0);
+          return<div style={{marginTop:6}}>
+            <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+              {curEvtRounds.length>0&&<button onClick={clearHistPaste} style={{...S.btnSm,fontSize:9,background:"#7f1d1d",color:"#fca5a5"}}>Clear {tourney?.name||"Current"} ({curEvtRounds.length})</button>}
+              {allBuckets.length>0&&<button onClick={()=>{if(confirm("Clear historical rounds for ALL "+allBuckets.length+" events? This cannot be undone."))clearAllHistPaste();}} style={{...S.btnSm,fontSize:9,background:"#450a0a",color:"#fca5a5",border:"1px solid #7f1d1d"}}>Clear All Events ({totalRounds})</button>}
+              {curEvtRounds.length>0&&<span style={{fontSize:10,color:"#22c55e"}}>{curEvtRounds.length} rounds for {tourney?.name||"current event"}</span>}
+              {curEvtRounds.length===0&&tourney&&<span style={{fontSize:10,color:"#64748b"}}>No rounds yet for {tourney.name}</span>}
+            </div>
+            {allBuckets.length>0&&<div style={{marginTop:6,padding:"6px 9px",background:"#0a0e17",border:"1px solid #1e293b",borderRadius:4,fontSize:9,color:"#64748b"}}>
+              <div style={{fontWeight:700,color:"#94a3b8",marginBottom:3}}>All event buckets ({allBuckets.length}):</div>
+              {allBuckets.sort((a,b)=>b.count-a.count).map(b=>(<span key={b.k} style={{display:"inline-block",padding:"1px 6px",margin:"1px 3px 1px 0",background:b.eventName===tourney?.name?"#164e63":"#1e293b",color:b.eventName===tourney?.name?"#22d3ee":"#94a3b8",borderRadius:3}}>{b.eventName} · {b.count}r</span>))}
+            </div>}
+          </div>;
+        })()}
         {histPasteLog.length>0&&<div style={{marginTop:6,display:"flex",flexDirection:"column",gap:3}}>{histPasteLog.map((l,i)=>(<div key={i} style={{fontSize:10,color:l.ok?"#4ade80":"#fca5a5"}}>{l.msg}</div>))}</div>}
       </div>
       {/* Course Fit — DG + AV Basket */}
@@ -534,10 +691,27 @@ function App(){
           {[...players].sort((a,b)=>((b.course_fit_adj||0)+(b.course_history_adj||0)+(b.similar_course_adj||0))-((a.course_fit_adj||0)+(a.course_history_adj||0)+(a.similar_course_adj||0))).slice(0,15).map((p,i)=>{const bk=p.similar_course_adj||0;const br=p.basket_rounds||0;const hasBk=br>=MIN_BASKET_ROUNDS;const combined=(p.course_fit_adj||0)+(p.course_history_adj||0)+bk;return<tr key={p.id} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{topFit.has(p.id)?"🎯 ":""}{topBasket.has(p.id)?"🔶 ":""}{p.name}</td><td style={{...S.td,color:(p.course_fit_adj||0)>0?"#22c55e":"#ef4444"}}>{(p.course_fit_adj||0)>0?"+":""}{(p.course_fit_adj||0).toFixed(3)}</td><td style={{...S.td,color:(p.course_history_adj||0)>0?"#22c55e":"#ef4444"}}>{(p.course_history_adj||0)>0?"+":""}{(p.course_history_adj||0).toFixed(3)}</td><td style={{...S.td,color:hasBk?(bk>0?"#f59e0b":"#ef4444"):"#334155"}}>{hasBk?(bk>0?"+":"")+bk.toFixed(3):"—"}</td><td style={{...S.td,color:"#475569",fontSize:9}}>{br>0?br+"r":""}</td><td style={{...S.td,fontWeight:700}}>{combined>0?"+":""}{combined.toFixed(3)}</td></tr>;})}
         </tbody></table></div></div>}
       {/* Weather */}
-      <div style={S.section}><h3 style={S.h3}>🌤 Weather</h3><div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10}}><input value={weatherCity} onChange={e=>setWeatherCity(e.target.value)} placeholder={tourney?.city||"Enter city..."} style={{...S.inp,maxWidth:250}}/><button onClick={fetchWeather} disabled={weatherLoading} style={S.btnSm}>{weatherLoading?"...":"Fetch"}</button></div>
+      <div style={S.section}><h3 style={S.h3}>🌤 Weather <span style={{fontSize:9,color:"#64748b",fontWeight:400}}>Open-Meteo · 7-day forecast</span></h3>
+        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10}}><input value={weatherCity} onChange={e=>setWeatherCity(e.target.value)} placeholder={tourney?.city||"Enter city..."} style={{...S.inp,maxWidth:250}}/><button onClick={fetchWeather} disabled={weatherLoading} style={S.btnSm}>{weatherLoading?"...":"Fetch"}</button>
+          {weatherData?.location&&<span style={{fontSize:10,color:"#94a3b8"}}>📍 {weatherData.location.name}{weatherData.location.region?", "+weatherData.location.region:""}</span>}
+        </div>
         {weatherData?.error&&<div style={{fontSize:11,color:"#fca5a5"}}>{weatherData.error}</div>}
-        {weatherData?.forecast&&<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:8}}>{weatherData.forecast.forecastday.map(d=>{const windy=d.day.maxwind_mph>=15,rainy=d.day.daily_chance_of_rain>=40;return<div key={d.date} style={{padding:10,background:"#0f172a",borderRadius:6,border:"1px solid "+(windy||rainy?"#f59e0b":"#1e293b")}}><div style={{fontSize:10,fontWeight:700,color:"#cbd5e1"}}>{new Date(d.date+"T12:00").toLocaleDateString("en",{weekday:"short",month:"short",day:"numeric"})}</div><div style={{fontSize:18,fontWeight:700,color:"#e2e8f0"}}>{d.day.maxtemp_f?.toFixed(0)}°F</div><div style={{fontSize:9,color:"#64748b"}}>{d.day.condition?.text}</div><div style={{fontSize:9,color:windy?"#f59e0b":"#64748b"}}>💨 {d.day.maxwind_mph}mph</div><div style={{fontSize:9,color:rainy?"#f59e0b":"#64748b"}}>🌧 {d.day.daily_chance_of_rain}%</div></div>;})}</div>}
-        {weatherInsights&&<div style={{marginTop:12}}>{weatherInsights.tips.map((t,i)=>(<div key={i} style={{padding:"8px 12px",marginBottom:6,background:"#0f172a",borderRadius:5,borderLeft:"3px solid #f59e0b",fontSize:11,color:"#e2e8f0"}}><span style={{marginRight:6}}>{t.icon}</span>{t.text}</div>))}</div>}
+        {weatherInsights&&weatherInsights.days>0&&<div style={{marginBottom:10,padding:"6px 11px",background:"#0a0e17",borderRadius:4,fontSize:10,color:"#94a3b8",display:"flex",gap:14,flexWrap:"wrap"}}>
+          <span>Avg wind: <b style={{color:weatherInsights.avgWind>=15?"#f59e0b":"#cbd5e1"}}>{weatherInsights.avgWind.toFixed(0)}mph</b></span>
+          <span>Max gust: <b style={{color:weatherInsights.maxGust>=25?"#f59e0b":"#cbd5e1"}}>{weatherInsights.maxGust.toFixed(0)}mph</b></span>
+          <span>Total precip: <b style={{color:weatherInsights.totalPrecip>=0.5?"#22d3ee":"#cbd5e1"}}>{weatherInsights.totalPrecip.toFixed(2)}in</b></span>
+          <span>Avg temp: <b style={{color:"#cbd5e1"}}>{weatherInsights.avgTemp.toFixed(0)}°F</b></span>
+        </div>}
+        {weatherData?.forecast&&<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:8}}>{weatherData.forecast.forecastday.map(d=>{const windy=d.day.maxwind_mph>=15,rainy=d.day.daily_chance_of_rain>=40;const dow=new Date(d.date+"T12:00").getDay();const isWeekend=dow===4||dow===5||dow===6||dow===0;/* Thu-Sun tournament days */
+          return<div key={d.date} style={{padding:10,background:isWeekend?"#0f172a":"#0a0e17",borderRadius:6,border:"1px solid "+(windy||rainy?"#f59e0b":isWeekend?"#1e293b":"#111827"),opacity:isWeekend?1:0.7}}>
+            <div style={{fontSize:10,fontWeight:700,color:isWeekend?"#22d3ee":"#64748b"}}>{new Date(d.date+"T12:00").toLocaleDateString("en",{weekday:"short",month:"short",day:"numeric"})}</div>
+            <div style={{fontSize:18,fontWeight:700,color:"#e2e8f0"}}>{d.day.maxtemp_f?.toFixed(0)}°<span style={{fontSize:11,color:"#64748b"}}>/{d.day.mintemp_f?.toFixed(0)}°</span></div>
+            <div style={{fontSize:9,color:"#64748b",marginBottom:2}}>{d.day.condition?.text}</div>
+            <div style={{fontSize:9,color:windy?"#f59e0b":"#64748b"}}>💨 {d.day.maxwind_mph?.toFixed(0)}mph{d.day.maxgust_mph>d.day.maxwind_mph?" (gust "+d.day.maxgust_mph.toFixed(0)+")":""}</div>
+            <div style={{fontSize:9,color:rainy?"#f59e0b":"#64748b"}}>🌧 {d.day.daily_chance_of_rain?.toFixed(0)}%{d.day.totalprecip_in>=0.1?" · "+d.day.totalprecip_in.toFixed(2)+'"':""}</div>
+          </div>;})}</div>}
+        {weatherInsights&&weatherInsights.tips.length>0&&<div style={{marginTop:12}}><div style={{fontSize:10,fontWeight:700,color:"#f59e0b",marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Conditions Analysis</div>{weatherInsights.tips.map((t,i)=>(<div key={i} style={{padding:"8px 12px",marginBottom:6,background:"#0f172a",borderRadius:5,borderLeft:"3px solid #f59e0b",fontSize:11,color:"#e2e8f0"}}><span style={{marginRight:6}}>{t.icon}</span>{t.text}</div>))}</div>}
+        {weatherInsights&&weatherInsights.tips.length===0&&weatherInsights.days>0&&<div style={{marginTop:12,padding:"8px 12px",background:"#0f172a",borderRadius:5,fontSize:11,color:"#64748b"}}>No notable weather conditions expected — standard scoring conditions likely.</div>}
       </div>
     </div>}
 
@@ -571,6 +745,12 @@ function App(){
         <div>
           {histWeights&&<div style={{marginBottom:20,padding:14,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}>
             <h3 style={S.h3}>📊 Historical Optimal Weights (5yr)</h3>
+            {(()=>{const curRounds=getHistRoundsForEvent(tourney?.name);const evtNames=new Set(curRounds.map(r=>r._eventName).filter(Boolean));const primaryEvt=curRounds.length>0?(curRounds[0]._eventName||tourney?.name||"unknown"):null;
+              return<div style={{fontSize:10,marginBottom:8,padding:"6px 10px",borderRadius:4,background:primaryEvt===tourney?.name?"#0a2e1a":"#1a1a0e",color:primaryEvt===tourney?.name?"#4ade80":"#fbbf24",border:"1px solid "+(primaryEvt===tourney?.name?"#166534":"#854d0e")}}>
+                {primaryEvt===tourney?.name?"✓ Source: ":"⚠ Source: "}<b>{primaryEvt||"unknown"}</b> ({curRounds.length} rounds{evtNames.size>1?" · "+evtNames.size+" events mixed":""})
+                {primaryEvt&&primaryEvt!==tourney?.name&&<div style={{marginTop:3,color:"#94a3b8"}}>These weights may not apply to {tourney?.name||"the current event"}.</div>}
+              </div>;
+            })()}
             <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>Year</th><th style={S.th}>Dist</th><th style={S.th}>Acc</th><th style={{...S.th,color:"#475569",fontStyle:"italic"}}>OTT</th><th style={S.th}>App</th><th style={S.th}>ARG</th><th style={S.th}>Putt</th><th style={S.th}>n</th></tr></thead><tbody>
               {histWeights.map((y,i)=>{const ott=y.opt.corrs.find(c=>c.k==="sg_ott")?.pct||0;return(<tr key={y.year} style={i%2?S.trO:S.trE}><td style={{...S.td,fontWeight:700}}>{y.year}</td><td style={{...S.td,color:"#22d3ee"}}>{Math.round(ott*OTT_DIST_RATIO)}%</td><td style={{...S.td,color:"#22d3ee"}}>{Math.round(ott*OTT_ACC_RATIO)}%</td><td style={{...S.td,color:"#475569",fontStyle:"italic"}}>{ott}%</td>{y.opt.corrs.filter(c=>c.k!=="sg_ott").map(c=><td key={c.k} style={{...S.td,color:"#22d3ee"}}>{c.pct}%</td>)}<td style={S.tdD}>{y.opt.n}</td></tr>);})}
               {hwAggregate&&(()=>{const ott=hwAggregate.sg_ott||0;return<tr style={{background:"#0a2e1a"}}><td style={{...S.td,fontWeight:700,color:"#22c55e"}}>AVG</td><td style={{...S.td,fontWeight:700,color:"#22c55e"}}>{Math.round(ott*OTT_DIST_RATIO)}%</td><td style={{...S.td,fontWeight:700,color:"#22c55e"}}>{Math.round(ott*OTT_ACC_RATIO)}%</td><td style={{...S.td,color:"#475569",fontStyle:"italic"}}>{ott}%</td>{SG_CATS.filter(c=>c.k!=="sg_ott").map(c=><td key={c.k} style={{...S.td,fontWeight:700,color:"#22c55e"}}>{hwAggregate[c.k]}%</td>)}<td style={S.td}></td></tr>;})()}
@@ -808,6 +988,133 @@ function App(){
             <p style={{marginTop:8,color:"#475569",fontStyle:"italic"}}>"Apply These Weights" updates only SG weights, not context multipliers.</p>
           </div>
         </div></div>}
+
+      {/* ═══ EV Play Grading ═══ */}
+      {gradingSim&&gradeResults&&gradingSim.bets&&gradingSim.bets.length>0&&(()=>{
+        /* Build resultsByKey lookup for bet grading */
+        const rk={};gradeResults.forEach(r=>{if(r.pid)rk[r.pid]=r;if(r.name){rk[normName(r.name)]=r;rk[lastFirst(r.name)]=r;}});
+        const graded=gradingSim.bets.map(b=>({...b,...gradeBet(b,rk)}));
+        const resolved=graded.filter(b=>b.outcome==="WIN"||b.outcome==="LOSS"||b.outcome==="VOID");
+        const settled=graded.filter(b=>b.outcome==="WIN"||b.outcome==="LOSS");
+        const wins=settled.filter(b=>b.outcome==="WIN").length;
+        const losses=settled.filter(b=>b.outcome==="LOSS").length;
+        const voids=graded.filter(b=>b.outcome==="VOID").length;
+        const noData=graded.filter(b=>b.outcome==="NO_DATA"||b.outcome==="NO_OPP_DATA").length;
+        const hitRate=settled.length>0?wins/settled.length:0;
+        const unitPL=resolved.reduce((s,b)=>s+b.unitPL,0);
+        const unitStaked=settled.length;/* 1 unit per settled bet */
+        const unitROI=unitStaked>0?unitPL/unitStaked:0;
+        const kellyPL=resolved.reduce((s,b)=>s+b.kellyPL,0);
+        const kellyStaked=settled.reduce((s,b)=>s+(b.kelly||0),0);
+        const kellyROI=kellyStaked>0?kellyPL/kellyStaked:0;
+        /* Calibration: avg sim prob for settled bets vs actual hit rate */
+        const avgSimProb=settled.length>0?settled.reduce((s,b)=>s+b.simProb,0)/settled.length:0;
+        const calibrationDelta=hitRate-avgSimProb;
+        /* By market breakdown */
+        const mkts=["win","top_5","top_10","top_20","make_cut","matchup"];
+        const byMkt=mkts.map(m=>{const mb=graded.filter(b=>b.mkt===m);const ms=mb.filter(b=>b.outcome==="WIN"||b.outcome==="LOSS");const mw=ms.filter(b=>b.outcome==="WIN").length;const mpl=mb.filter(b=>["WIN","LOSS","VOID"].includes(b.outcome)).reduce((s,b)=>s+b.unitPL,0);const mkpl=mb.filter(b=>["WIN","LOSS","VOID"].includes(b.outcome)).reduce((s,b)=>s+b.kellyPL,0);const mAvgSim=ms.length>0?ms.reduce((s,b)=>s+b.simProb,0)/ms.length:0;const mHit=ms.length>0?mw/ms.length:0;return{mkt:m,n:mb.length,settled:ms.length,wins:mw,hitRate:mHit,avgSimProb:mAvgSim,unitPL:mpl,unitROI:ms.length>0?mpl/ms.length:0,kellyPL:mkpl};}).filter(r=>r.n>0);
+        /* By EV band */
+        const bands=[{label:"3-5%",min:0.03,max:0.05},{label:"5-8%",min:0.05,max:0.08},{label:"8-12%",min:0.08,max:0.12},{label:"12%+",min:0.12,max:Infinity}];
+        const byBand=bands.map(band=>{const bb=graded.filter(b=>b.evDevig>=band.min&&b.evDevig<band.max);const bs=bb.filter(b=>b.outcome==="WIN"||b.outcome==="LOSS");const bw=bs.filter(b=>b.outcome==="WIN").length;const bpl=bb.filter(b=>["WIN","LOSS","VOID"].includes(b.outcome)).reduce((s,b)=>s+b.unitPL,0);return{label:band.label,n:bb.length,settled:bs.length,wins:bw,hitRate:bs.length>0?bw/bs.length:0,unitPL:bpl,unitROI:bs.length>0?bpl/bs.length:0};}).filter(r=>r.n>0);
+
+        return<div style={S.section}><h3 style={S.h3}>💰 EV Play Grading</h3>
+          <div style={{fontSize:10,color:"#94a3b8",marginBottom:10}}>{graded.length} bets snapshotted at sim time · {settled.length} settled · {voids} void · {noData} missing data</div>
+
+          {/* Top-line P&L cards */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:8,marginBottom:14}}>
+            <div style={{padding:10,background:"#0f172a",borderRadius:5,border:"1px solid #1e293b"}}>
+              <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Hit Rate</div>
+              <div style={{fontSize:18,fontWeight:700,color:"#22d3ee"}}>{pFmtS(hitRate)}</div>
+              <div style={{fontSize:9,color:"#475569"}}>{wins}W - {losses}L</div>
+            </div>
+            <div style={{padding:10,background:"#0f172a",borderRadius:5,border:"1px solid #1e293b"}}>
+              <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Unit ROI (1u/bet)</div>
+              <div style={{fontSize:18,fontWeight:700,color:unitROI>0.05?"#22c55e":unitROI>0?"#4ade80":unitROI<-0.05?"#ef4444":"#94a3b8"}}>{(unitROI>=0?"+":"")}{(unitROI*100).toFixed(1)}%</div>
+              <div style={{fontSize:9,color:"#475569"}}>{(unitPL>=0?"+":"")}{unitPL.toFixed(2)} units on {unitStaked}</div>
+            </div>
+            <div style={{padding:10,background:"#0f172a",borderRadius:5,border:"1px solid #1e293b"}}>
+              <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Kelly $ P&amp;L</div>
+              <div style={{fontSize:18,fontWeight:700,color:kellyPL>0?"#22c55e":kellyPL<0?"#ef4444":"#94a3b8"}}>{(kellyPL>=0?"+$":"-$")}{Math.abs(kellyPL).toFixed(2)}</div>
+              <div style={{fontSize:9,color:"#475569"}}>ROI: {(kellyROI>=0?"+":"")}{(kellyROI*100).toFixed(1)}% on ${kellyStaked.toFixed(2)}</div>
+            </div>
+            <div style={{padding:10,background:"#0f172a",borderRadius:5,border:"1px solid #1e293b"}}>
+              <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Calibration</div>
+              <div style={{fontSize:18,fontWeight:700,color:Math.abs(calibrationDelta)<0.02?"#22c55e":Math.abs(calibrationDelta)<0.05?"#f59e0b":"#ef4444"}}>{(calibrationDelta>=0?"+":"")}{(calibrationDelta*100).toFixed(1)}pp</div>
+              <div style={{fontSize:9,color:"#475569"}}>avg sim {pFmtS(avgSimProb)} vs actual {pFmtS(hitRate)}</div>
+            </div>
+          </div>
+
+          {/* By market */}
+          {byMkt.length>0&&<div style={{marginBottom:14}}>
+            <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",marginBottom:5,textTransform:"uppercase"}}>By Market</div>
+            <div style={S.tW}><table style={S.table}><thead><tr><th style={{...S.th,textAlign:"left"}}>Market</th><th style={S.th}>Bets</th><th style={S.th}>W-L</th><th style={S.th}>Hit%</th><th style={S.th}>Sim% avg</th><th style={S.th}>Δ</th><th style={S.th}>Unit P&amp;L</th><th style={S.th}>Unit ROI</th><th style={S.th}>Kelly P&amp;L</th></tr></thead><tbody>
+              {byMkt.map((r,i)=>{const delta=r.hitRate-r.avgSimProb;return<tr key={r.mkt} style={i%2?S.trO:S.trE}>
+                <td style={S.tdN}>{r.mkt==="matchup"?"Matchup":MARKET_LABELS[r.mkt]}</td>
+                <td style={S.td}>{r.n}</td>
+                <td style={S.td}>{r.wins}-{r.settled-r.wins}</td>
+                <td style={{...S.td,color:"#22d3ee"}}>{pFmtS(r.hitRate)}</td>
+                <td style={{...S.td,color:"#94a3b8"}}>{pFmtS(r.avgSimProb)}</td>
+                <td style={{...S.td,color:Math.abs(delta)<0.03?"#94a3b8":delta>0?"#22c55e":"#ef4444"}}>{(delta>=0?"+":"")}{(delta*100).toFixed(1)}pp</td>
+                <td style={{...S.td,fontWeight:700,color:r.unitPL>0?"#22c55e":r.unitPL<0?"#ef4444":"#94a3b8"}}>{(r.unitPL>=0?"+":"")}{r.unitPL.toFixed(2)}</td>
+                <td style={{...S.td,fontWeight:700,color:r.unitROI>0.05?"#22c55e":r.unitROI>0?"#4ade80":r.unitROI<-0.05?"#ef4444":"#94a3b8"}}>{(r.unitROI>=0?"+":"")}{(r.unitROI*100).toFixed(1)}%</td>
+                <td style={{...S.td,color:r.kellyPL>0?"#22c55e":r.kellyPL<0?"#ef4444":"#94a3b8"}}>{(r.kellyPL>=0?"+$":"-$")}{Math.abs(r.kellyPL).toFixed(2)}</td>
+              </tr>;})}
+            </tbody></table></div>
+          </div>}
+
+          {/* By EV band */}
+          {byBand.length>0&&<div style={{marginBottom:14}}>
+            <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",marginBottom:5,textTransform:"uppercase"}}>By EV Band</div>
+            <div style={{fontSize:9,color:"#475569",marginBottom:6}}>Critical signal: if high-EV bands are negative ROI, your model is biased at the top. +EV bets should trend positive across a large sample.</div>
+            <div style={S.tW}><table style={S.table}><thead><tr><th style={{...S.th,textAlign:"left"}}>EV Range</th><th style={S.th}>Bets</th><th style={S.th}>W-L</th><th style={S.th}>Hit%</th><th style={S.th}>Unit P&amp;L</th><th style={S.th}>Unit ROI</th></tr></thead><tbody>
+              {byBand.map((r,i)=>(<tr key={r.label} style={i%2?S.trO:S.trE}>
+                <td style={S.tdN}>{r.label}</td>
+                <td style={S.td}>{r.n}</td>
+                <td style={S.td}>{r.wins}-{r.settled-r.wins}</td>
+                <td style={{...S.td,color:"#22d3ee"}}>{pFmtS(r.hitRate)}</td>
+                <td style={{...S.td,fontWeight:700,color:r.unitPL>0?"#22c55e":r.unitPL<0?"#ef4444":"#94a3b8"}}>{(r.unitPL>=0?"+":"")}{r.unitPL.toFixed(2)}</td>
+                <td style={{...S.td,fontWeight:700,color:r.unitROI>0.05?"#22c55e":r.unitROI>0?"#4ade80":r.unitROI<-0.05?"#ef4444":"#94a3b8"}}>{(r.unitROI>=0?"+":"")}{(r.unitROI*100).toFixed(1)}%</td>
+              </tr>))}
+            </tbody></table></div>
+          </div>}
+
+          {/* Per-bet detail table */}
+          <div>
+            <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",marginBottom:5,textTransform:"uppercase"}}>Individual Bets ({graded.length})</div>
+            <div style={S.tW}><table style={S.table}><thead><tr>
+              <th style={{...S.th,textAlign:"left"}}>Player</th>
+              <th style={{...S.th,textAlign:"left"}}>Market</th>
+              <th style={S.th}>Sim%</th>
+              <th style={S.th}>Odds</th>
+              <th style={S.th}>Book</th>
+              <th style={S.th}>EV</th>
+              <th style={S.th}>Kelly $</th>
+              <th style={S.th}>Finish</th>
+              <th style={S.th}>Outcome</th>
+              <th style={S.th}>Unit P&amp;L</th>
+            </tr></thead><tbody>
+              {graded.sort((a,b)=>(b.evDevig||0)-(a.evDevig||0)).map((b,i)=>{const r=rk[b.pid]||rk[normName(b.name)];const finish=r?r.finish:null;const outColor=b.outcome==="WIN"?"#22c55e":b.outcome==="LOSS"?"#ef4444":b.outcome==="VOID"?"#f59e0b":"#64748b";
+                return<tr key={i} style={i%2?S.trO:S.trE}>
+                  <td style={S.tdN}>{b.name}{b.opponent?<span style={{color:"#64748b",fontSize:9}}> vs {b.opponent}</span>:""}</td>
+                  <td style={{...S.td,textAlign:"left",color:"#94a3b8"}}>{b.mkt==="matchup"?"H2H":MARKET_LABELS[b.mkt]}</td>
+                  <td style={S.tdH}>{pFmtS(b.simProb)}</td>
+                  <td style={S.td}>{b.oddsDec.toFixed(2)}</td>
+                  <td style={{...S.tdD,fontSize:9}}>{(b.book||"").slice(0,3).toUpperCase()}</td>
+                  <td style={{...S.td,color:"#22d3ee"}}>{(b.evDevig>=0?"+":"")}{(b.evDevig*100).toFixed(1)}%</td>
+                  <td style={{...S.td,color:"#22d3ee"}}>${b.kelly.toFixed(2)}</td>
+                  <td style={{...S.td,color:finish!=null&&finish<=20?"#22c55e":finish!=null&&finish<900?"#94a3b8":"#64748b"}}>{finish==null?"—":finish>=900?"MC":"#"+finish}</td>
+                  <td style={{...S.td,fontWeight:700,color:outColor}}>{b.outcome==="NO_DATA"?"—":b.outcome==="NO_OPP_DATA"?"—":b.outcome}</td>
+                  <td style={{...S.td,fontWeight:700,color:b.unitPL>0?"#22c55e":b.unitPL<0?"#ef4444":"#94a3b8"}}>{b.unitPL!==0?(b.unitPL>=0?"+":"")+b.unitPL.toFixed(2):"0.00"}</td>
+                </tr>;})}
+            </tbody></table></div>
+          </div>
+        </div>;
+      })()}
+
+      {/* Legacy sim without bets snapshot */}
+      {gradingSim&&gradeResults&&(!gradingSim.bets||gradingSim.bets.length===0)&&<div style={S.section}>
+        <div style={{padding:"10px 14px",background:"#1a1a0e",border:"1px solid #854d0e",borderRadius:5,fontSize:11,color:"#fbbf24"}}>⚠ This sim was run before EV bet tracking was enabled (v5.1+). Run a new sim with qualified bets to populate the EV Play Grading dashboard.</div>
+      </div>}
 
       <div style={{...S.dv,margin:"22px 0"}}/>
       <div style={S.section}><h3 style={S.h3}>💾 Backup &amp; Restore</h3>
