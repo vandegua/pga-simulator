@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PGA Tournament Simulator v4.9</title>
+<title>PGA Tournament Simulator v5.0</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
@@ -29,7 +29,8 @@ const DG_KEY_HIST="c741a29a2fdc66f8ff76ea573847";
 const SIM_COUNTS=[1000,5000,10000,25000,50000];
 const MARKETS=["win","top_5","top_10","top_20","make_cut"];
 const MARKET_LABELS={win:"Win",top_5:"Top 5",top_10:"Top 10",top_20:"Top 20",make_cut:"Make Cut"};
-const ROUND_STDEV=2.8;const KNOWN_BOOKS=["draftkings"];const MAX_STORE=15000;
+const DEFAULT_SIGMA=3.0;const KNOWN_BOOKS=["draftkings","fanduel","betmgm","caesars","pinnacle","bet365","williamhill"];const PRIMARY_BOOK="draftkings";const MAX_STORE=15000;
+const DEFAULT_MIN_EV={win:0.08,top_5:0.05,top_10:0.05,top_20:0.04,make_cut:0.03,matchup:0.03};
 const OTT_DIST_RATIO=0.6;const OTT_ACC_RATIO=0.4;
 const MIN_BASKET_ROUNDS=8;
 const PROXIES=[
@@ -56,6 +57,12 @@ const pFmtS=v=>v!=null?(v*100).toFixed(1)+"%":"-";
 const evFmt=v=>{if(v==null)return"-";const s=(v*100).toFixed(1);return v>0?"+"+s+"%":s+"%";};
 const ci95=(p,n)=>n>0?1.96*Math.sqrt(Math.max(0,p*(1-p))/n):0;
 const kellyBet=(sp,dec,frac,br)=>{if(!dec||dec<=1||sp<=0)return 0;const b=dec-1,q=1-sp,f=(b*sp-q)/b;return f>0?f*frac*br:0;};
+/* ── de-vigging: normalize implied probabilities to sum to 1.0 ── */
+const devigImplied=(players,mkt,oddsKey)=>{const impls=players.map(p=>{const od=p.playerOdds?.[mkt];return(od?.[oddsKey]>1)?decToImp(od[oddsKey]):0;});const sum=impls.reduce((a,b)=>a+b,0);if(sum<=0)return impls.map(()=>0);return impls.map(i=>i>0?i/sum:0);};
+/* ── Matchup EV: p_win × (odds-1) - p_loss, where p_loss = 1 - p_win - p_tie ── */
+const matchupEV=(p_win,odds,p_tie=0)=>{if(!odds||odds<=1||p_win==null)return null;const p_loss=Math.max(0,1-p_win-p_tie);return p_win*(odds-1)-p_loss;};
+/* ── Bet qualification: true if lower-CI bound > implied (after devig) ── */
+const qualifiesBet=(sp,n,impliedDevig,minEV)=>{if(sp==null||impliedDevig==null)return false;const ci=ci95(sp,n);const lowerBound=Math.max(0,sp-ci);const edge=lowerBound-impliedDevig;return edge>=minEV;};
 const downloadCSV=(rows,fname)=>{if(!rows.length)return;const hdrs=Object.keys(rows[0]);const csv=[hdrs.join(","),...rows.map(r=>hdrs.map(h=>{const v=r[h];return typeof v==="string"&&v.includes(",")?"\""+v+"\"":v??""}).join(","))].join("\n");const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download=fname;a.click();};
 const sGet=k=>{try{const v=localStorage.getItem("pga3_"+k);return v?JSON.parse(v):null;}catch{return null;}};
 const sSet=(k,v)=>{try{localStorage.setItem("pga3_"+k,JSON.stringify(v));}catch{}};
@@ -102,10 +109,10 @@ const buildCourseSG=(course,allCourses)=>{
 
 /* ── DataGolf fetch ── */
 const dgFetch=async(path,params,pi)=>{const url=new URL(DG_BASE+path);Object.entries(params).forEach(([k,v])=>url.searchParams.set(k,v));url.searchParams.set("file_format","json");const raw=url.toString(),proxied=PROXIES[pi]?.fn(raw)||raw;const timeout=new Promise((_,rej)=>setTimeout(()=>rej(new Error("timeout")),15000));const req=fetch(proxied,{headers:{Accept:"application/json"}}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json();}).then(d=>d?.contents?JSON.parse(d.contents):d);return Promise.race([req,timeout]);};
-const findArr=d=>{if(Array.isArray(d))return d;if(typeof d!=="object"||!d)return null;for(const k of Object.keys(d)){if(Array.isArray(d[k])&&d[k].length>0&&typeof d[k][0]==="object")return d[k];}const v=Object.values(d);if(v.length>5&&v.every(x=>typeof x==="object"&&x&&!Array.isArray(x)))return v;return null;};
+const findArr=d=>{if(Array.isArray(d))return d;if(typeof d!=="object"||!d)return null;const preferred=["match_list","matchups","matches","data","players","scores"];for(const k of preferred){if(Array.isArray(d[k])&&d[k].length>0&&typeof d[k][0]==="object")return d[k];}let best=null;for(const k of Object.keys(d)){if(Array.isArray(d[k])&&d[k].length>0&&typeof d[k][0]==="object"){if(!best||d[k].length>best.length)best=d[k];}}if(best)return best;const v=Object.values(d);if(v.length>5&&v.every(x=>typeof x==="object"&&x&&!Array.isArray(x)))return v;return null;};
 
 /* ── simulation engine ── */
-const runSim=(players,weights,n)=>{if(!players.length)return{results:[],allScores:null};const st=weights.sg_dist+weights.sg_acc+weights.sg_app+weights.sg_arg+weights.sg_putt;const w=st>0?{dist:weights.sg_dist/st,acc:weights.sg_acc/st,app:weights.sg_app/st,arg:weights.sg_arg/st,putt:weights.sg_putt/st}:{dist:.2,acc:.2,app:.2,arg:.2,putt:.2};const skills=players.map(p=>{const userSG=p.sg_dist*w.dist+p.sg_acc*w.acc+p.sg_app*w.app+p.sg_arg*w.arg+p.sg_putt*w.putt;const eqSG=(p.sg_dist+p.sg_acc+p.sg_app+p.sg_arg+p.sg_putt)*0.2;const delta=(userSG-eqSG)*SENSITIVITY;const base=(p.baseline||0)+delta;return base+(p.course_history_adj||0)*weights.course_history+(p.course_fit_adj||0)*weights.course_fit+(p.recent_form_adj||0)*weights.recent_form+(p.similar_course_adj||0)*weights.similar_course;});const res=players.map(()=>({w:0,t5:0,t10:0,t20:0,mc:0,tp:0}));const store=n<=MAX_STORE;const allScores=store?[]:null;for(let s=0;s<n;s++){const sc=skills.map(sk=>{let t=0;for(let r=0;r<4;r++)t+=-(sk+normalRandom()*ROUND_STDEV);return t;});if(store)allScores.push(new Float32Array(sc));const ix=sc.map((v,i)=>({v,i})).sort((a,b)=>a.v-b.v);let pos=1;for(let j=0;j<ix.length;){let k=j;while(k<ix.length&&Math.abs(ix[k].v-ix[j].v)<.001)k++;const avg=(pos+pos+k-j-1)/2;for(let m=j;m<k;m++){const pi=ix[m].i;res[pi].tp+=avg;if(avg<=1)res[pi].w++;if(avg<=5)res[pi].t5++;if(avg<=10)res[pi].t10++;if(avg<=20)res[pi].t20++;if(avg<=65)res[pi].mc++;}pos+=k-j;j=k;}}return{results:players.map((p,i)=>({...p,sim_win:res[i].w/n,sim_top5:res[i].t5/n,sim_top10:res[i].t10/n,sim_top20:res[i].t20/n,sim_make_cut:res[i].mc/n,avg_finish:res[i].tp/n})),allScores};};
+const runSim=(players,weights,n,sigma=DEFAULT_SIGMA)=>{if(!players.length)return{results:[],allScores:null};const st=weights.sg_dist+weights.sg_acc+weights.sg_app+weights.sg_arg+weights.sg_putt;const w=st>0?{dist:weights.sg_dist/st,acc:weights.sg_acc/st,app:weights.sg_app/st,arg:weights.sg_arg/st,putt:weights.sg_putt/st}:{dist:.2,acc:.2,app:.2,arg:.2,putt:.2};const skills=players.map(p=>{const userSG=p.sg_dist*w.dist+p.sg_acc*w.acc+p.sg_app*w.app+p.sg_arg*w.arg+p.sg_putt*w.putt;const eqSG=(p.sg_dist+p.sg_acc+p.sg_app+p.sg_arg+p.sg_putt)*0.2;const delta=(userSG-eqSG)*SENSITIVITY;const base=(p.baseline||0)+delta;return base+(p.course_history_adj||0)*weights.course_history+(p.course_fit_adj||0)*weights.course_fit+(p.recent_form_adj||0)*weights.recent_form+(p.similar_course_adj||0)*weights.similar_course;});const res=players.map(()=>({w:0,t5:0,t10:0,t20:0,mc:0,tp:0}));const store=n<=MAX_STORE;const allScores=store?[]:null;for(let s=0;s<n;s++){const sc=skills.map(sk=>{let t=0;for(let r=0;r<4;r++)t+=-(sk+normalRandom()*sigma);return t;});if(store)allScores.push(new Float32Array(sc));const ix=sc.map((v,i)=>({v,i})).sort((a,b)=>a.v-b.v);let pos=1;for(let j=0;j<ix.length;){let k=j;while(k<ix.length&&Math.abs(ix[k].v-ix[j].v)<.001)k++;const avg=(pos+pos+k-j-1)/2;for(let m=j;m<k;m++){const pi=ix[m].i;res[pi].tp+=avg;if(avg<=1)res[pi].w++;if(avg<=5)res[pi].t5++;if(avg<=10)res[pi].t10++;if(avg<=20)res[pi].t20++;if(avg<=65)res[pi].mc++;}pos+=k-j;j=k;}}return{results:players.map((p,i)=>({...p,sim_win:res[i].w/n,sim_top5:res[i].t5/n,sim_top10:res[i].t10/n,sim_top20:res[i].t20/n,sim_make_cut:res[i].mc/n,avg_finish:res[i].tp/n})),allScores};};
 const computeH2H=(allScores,players,pairs)=>{const idxMap={};players.forEach((p,i)=>idxMap[p.id]=i);const n=allScores.length,h2h={};for(const pair of pairs){const i=idxMap[pair.id1],j=idxMap[pair.id2];if(i==null||j==null)continue;let iW=0;for(let s=0;s<n;s++){if(allScores[s][i]<allScores[s][j])iW++;}h2h[pair.id1+"_"+pair.id2]=iW/n;h2h[pair.id2+"_"+pair.id1]=1-iW/n;}return h2h;};
 
 /* ══ Course SG Difficulty Profile ══ */
@@ -160,8 +167,23 @@ function PlayerCard({player:p,n,bankroll,kellyFrac}){
     </div></div>;
 }
 
+/* ══ BetControlsBar — shared controls for EV/Matchup tabs ══ */
+function BetControlsBar({bankroll,setBankroll,kellyFrac,setKellyFrac,oddsMode,setOddsMode,devigOn,setDevigOn,useCIFilter,setUseCIFilter,showOnlyQualified,setShowOnlyQualified,minEV,setMinEV,mkt,onExport}){
+  const thrKey=mkt||"win";const thrVal=minEV[thrKey]??0;
+  return(<div style={{padding:"8px 10px",background:"#0f172a",borderRadius:6,border:"1px solid #1e293b",marginBottom:10,display:"flex",flexWrap:"wrap",gap:10,alignItems:"center",fontSize:10}}>
+    <div style={{display:"flex",gap:4,alignItems:"center"}}><span style={{color:"#94a3b8"}}>Bankroll $</span><input type="number" value={bankroll} onChange={e=>setBankroll(+e.target.value)} style={{...S.inp,width:70,padding:"3px 6px",fontSize:10}} min={0}/></div>
+    <div style={{display:"flex",gap:4,alignItems:"center"}}><span style={{color:"#94a3b8"}}>Kelly</span><select value={kellyFrac} onChange={e=>setKellyFrac(+e.target.value)} style={{...S.inp,width:70,padding:"3px 6px",fontSize:10}}><option value={0.25}>¼</option><option value={0.5}>½</option><option value={1}>Full</option></select></div>
+    <div style={{display:"flex",gap:4,alignItems:"center"}}><span style={{color:"#94a3b8"}}>Odds</span><select value={oddsMode} onChange={e=>setOddsMode(e.target.value)} style={{...S.inp,width:70,padding:"3px 6px",fontSize:10}}><option value="dk">DK</option><option value="best">Best</option><option value="median">Median</option></select></div>
+    <label style={{display:"flex",gap:4,alignItems:"center",cursor:"pointer",color:devigOn?"#22d3ee":"#64748b"}}><input type="checkbox" checked={devigOn} onChange={e=>setDevigOn(e.target.checked)}/><span>De-vig</span></label>
+    <label style={{display:"flex",gap:4,alignItems:"center",cursor:"pointer",color:useCIFilter?"#22d3ee":"#64748b"}}><input type="checkbox" checked={useCIFilter} onChange={e=>setUseCIFilter(e.target.checked)}/><span>CI filter</span></label>
+    <label style={{display:"flex",gap:4,alignItems:"center",cursor:"pointer",color:showOnlyQualified?"#22c55e":"#64748b"}}><input type="checkbox" checked={showOnlyQualified} onChange={e=>setShowOnlyQualified(e.target.checked)}/><span>Qualified only</span></label>
+    {mkt&&<div style={{display:"flex",gap:4,alignItems:"center"}}><span style={{color:"#94a3b8"}}>Min EV</span><input type="number" step="0.005" value={thrVal} onChange={e=>setMinEV({...minEV,[thrKey]:+e.target.value})} style={{...S.inp,width:60,padding:"3px 6px",fontSize:10}}/><span style={{color:"#64748b"}}>({(thrVal*100).toFixed(1)}%)</span></div>}
+    {onExport&&<button onClick={onExport} style={{...S.btnSm,marginLeft:"auto"}}>⬇ CSV</button>}
+  </div>);
+}
+
 /* ══════════════════════════════════ */
-/* ══════════  MAIN APP V4.9 ═══════ */
+/* ══════════  MAIN APP V5.0 ═══════ */
 /* ══════════════════════════════════ */
 function App(){
   const [tab,setTab]=useState("setup");const [subTab,setSubTab]=useState("sim_results");
@@ -179,6 +201,13 @@ function App(){
   const [sort,setSort]=useState({col:"sim_win",dir:"desc"});const [evS,setEvS]=useState({col:"ev_win",dir:"desc"});
   const [expanded,setExpanded]=useState(null);
   const [bankroll,setBankroll]=useState(1000);const [kellyFrac,setKellyFrac]=useState(0.5);
+  const [sigma,setSigma]=useState(DEFAULT_SIGMA);
+  const [minEV,setMinEV]=useState(DEFAULT_MIN_EV);
+  const [oddsMode,setOddsMode]=useState("dk");/* dk | best | median */
+  const [devigOn,setDevigOn]=useState(true);
+  const [useCIFilter,setUseCIFilter]=useState(true);
+  const [showOnlyQualified,setShowOnlyQualified]=useState(false);
+  const [evMktTab,setEvMktTab]=useState("win");
   const [compareItems,setCompareItems]=useState([]);const [showCompare,setShowCompare]=useState(false);
   const [showAll,setShowAll]=useState(false);
   const [courseCSV,setCourseCSV]=useState(null);const [courseMatch,setCourseMatch]=useState(null);const [courseMatchManual,setCourseMatchManual]=useState("");
@@ -194,16 +223,40 @@ function App(){
   const [gradeResults,setGradeResults]=useState(null);const [gradeCorr,setGradeCorr]=useState(null);
   const [gradePasteText,setGradePasteText]=useState("");
 
-  useEffect(()=>{const k=sGet("dg_key");if(k){setApiKey(k);setApiKeyInp(k);}const p=sGet("presets");if(p)setPresets(p);const h=sGet("hist");if(h)setHist(h);const sg=sGet("sgW");if(sg)setSgW(sg);const cx=sGet("ctxW");if(cx)setCtxW(prev=>({...prev,...cx}));const b=sGet("bankroll");if(b)setBankroll(b);const kf=sGet("kf");if(kf!=null)setKellyFrac(kf);const csv=sGet("courseCSV");if(csv)setCourseCSV(csv);const el=sGet("eventList");if(el)setEventList(el);const hr=sGet("histRounds");if(hr&&hr.length>0){/* rebuild weights from persisted rounds */const byY={};hr.forEach(r=>{const y=r._pasteYear||r.year||"?";if(!byY[y])byY[y]=[];byY[y].push(r);});const yd=[];Object.entries(byY).sort((a,b)=>b[0]-a[0]).forEach(([y,yR])=>{if(yR.length>10){const o=computeOptimalWeights(yR);if(o)yd.push({year:y,opt:o,rounds:yR.length});}});if(yd.length)setHistWeights(yd.slice(0,5));}},[]);
+  useEffect(()=>{const k=sGet("dg_key");if(k){setApiKey(k);setApiKeyInp(k);}const p=sGet("presets");if(p)setPresets(p);const h=sGet("hist");if(h)setHist(h);const sg=sGet("sgW");if(sg)setSgW(sg);const cx=sGet("ctxW");if(cx)setCtxW(prev=>({...prev,...cx}));const b=sGet("bankroll");if(b)setBankroll(b);const kf=sGet("kf");if(kf!=null)setKellyFrac(kf);const sig=sGet("sigma");if(sig!=null&&sig>=1&&sig<=5)setSigma(sig);const me=sGet("minEV");if(me)setMinEV(prev=>({...prev,...me}));const om=sGet("oddsMode");if(om)setOddsMode(om);const dv=sGet("devigOn");if(dv!=null)setDevigOn(dv);const ci=sGet("useCIFilter");if(ci!=null)setUseCIFilter(ci);const csv=sGet("courseCSV");if(csv)setCourseCSV(csv);const el=sGet("eventList");if(el)setEventList(el);const hr=sGet("histRounds");if(hr&&hr.length>0){const byY={};hr.forEach(r=>{const y=r._pasteYear||r.year||"?";if(!byY[y])byY[y]=[];byY[y].push(r);});const yd=[];Object.entries(byY).sort((a,b)=>b[0]-a[0]).forEach(([y,yR])=>{if(yR.length>10){const o=computeOptimalWeights(yR);if(o)yd.push({year:y,opt:o,rounds:yR.length});}});if(yd.length)setHistWeights(yd.slice(0,5));}},[]);
   useEffect(()=>{sSet("sgW",sgW);},[sgW]);useEffect(()=>{sSet("ctxW",ctxW);},[ctxW]);
   useEffect(()=>{sSet("bankroll",bankroll);},[bankroll]);useEffect(()=>{sSet("kf",kellyFrac);},[kellyFrac]);
+  useEffect(()=>{sSet("sigma",sigma);},[sigma]);
+  useEffect(()=>{sSet("minEV",minEV);},[minEV]);
+  useEffect(()=>{sSet("oddsMode",oddsMode);},[oddsMode]);
+  useEffect(()=>{sSet("devigOn",devigOn);},[devigOn]);
+  useEffect(()=>{sSet("useCIFilter",useCIFilter);},[useCIFilter]);
   useEffect(()=>{if(!courseCSV||!tourney?.course)return;const m=fuzzyMatch(tourney.course,courseCSV);if(m){setCourseMatch(m);setCourseMatchManual(m.course);const vecs=buildCourseVecs(courseCSV);setSimilarCourses(findSimilarCourses(m.course,vecs,10));}},[courseCSV,tourney]);
 
   /* ── Course characteristic radar from CSV ── */
   const courseSGData=useMemo(()=>buildCourseSG(courseMatch,courseCSV),[courseMatch,courseCSV]);
 
   const saveKey=()=>{const k=apiKeyInp.trim();setApiKey(k);sSet("dg_key",k);setError(null);};
-  const parseMatchupPairs=(ma)=>{const pairs=[];(findArr(ma)||[]).forEach(m=>{const id1=m.p1_dg_id||m.player1_dg_id||null,id2=m.p2_dg_id||m.player2_dg_id||null;const n1=m.player1||m.p1_player_name||"",n2=m.player2||m.p2_player_name||"";let dk1=0,dk2=0;Object.entries(m).forEach(([k,v])=>{if(typeof v!=="number")return;const kl=k.toLowerCase().replace(/[\s_]/g,"");if(KNOWN_BOOKS.some(b=>kl.includes(b))){if(kl.includes("p1")||kl.includes("player1"))dk1=Math.max(dk1,v);if(kl.includes("p2")||kl.includes("player2"))dk2=Math.max(dk2,v);}});if(id1&&id2)pairs.push({id1,id2,name1:n1||String(id1),name2:n2||String(id2),dk1,dk2});});return pairs;};
+  /* ── Matchup parser: handles nested {odds: {book: {p1,p2,tie}}}, flat {p1_book}, and multi-book ── */
+  const parseMatchupPairs=(ma)=>{const pairs=[];const arr=findArr(ma)||[];arr.forEach(m=>{
+    const id1=m.p1_dg_id||m.player1_dg_id||m.p1_id||null,id2=m.p2_dg_id||m.player2_dg_id||m.p2_id||null;
+    const n1=m.player1||m.p1_player_name||m.p1_name||"",n2=m.player2||m.p2_player_name||m.p2_name||"";
+    /* Collect all book odds — try nested odds.{book} first, then flat {p1_book} keys */
+    const books={};/* { book: {p1, p2, tie} } */
+    /* 1. Nested: m.odds = {draftkings: {p1: 2.0, p2: 1.85, tie: 15}, ...} */
+    if(m.odds&&typeof m.odds==="object"&&!Array.isArray(m.odds)){Object.entries(m.odds).forEach(([bk,v])=>{if(!v||typeof v!=="object")return;const bl=bk.toLowerCase().replace(/[\s_]/g,"");const matchedBook=KNOWN_BOOKS.find(b=>bl.includes(b));if(!matchedBook)return;books[matchedBook]={p1:+v.p1||+v.player1||0,p2:+v.p2||+v.player2||0,tie:+v.tie||0};});}
+    /* 2. Flat: m.p1_draftkings = 2.0, m.p2_draftkings = 1.85, m.tie_draftkings = 15 */
+    Object.entries(m).forEach(([k,v])=>{if(typeof v!=="number"||v<=0)return;const kl=k.toLowerCase().replace(/[\s_]/g,"");const matchedBook=KNOWN_BOOKS.find(b=>kl.includes(b));if(!matchedBook)return;if(!books[matchedBook])books[matchedBook]={p1:0,p2:0,tie:0};if(kl.includes("p1")||kl.includes("player1"))books[matchedBook].p1=Math.max(books[matchedBook].p1,v);else if(kl.includes("p2")||kl.includes("player2"))books[matchedBook].p2=Math.max(books[matchedBook].p2,v);else if(kl.includes("tie"))books[matchedBook].tie=Math.max(books[matchedBook].tie,v);});
+    /* DG model tie probability (from ties_prob or implied) */
+    const p_tie=+m.ties_prob||+m.p_tie||+m.tie_prob||0;
+    /* Best-of-all-books per player */
+    let best1=0,best1Book="",best2=0,best2Book="";Object.entries(books).forEach(([bk,o])=>{if(o.p1>best1){best1=o.p1;best1Book=bk;}if(o.p2>best2){best2=o.p2;best2Book=bk;}});
+    /* Median (consensus) across books with odds > 1 */
+    const sorted1=Object.values(books).map(o=>o.p1).filter(v=>v>1).sort((a,b)=>a-b);const sorted2=Object.values(books).map(o=>o.p2).filter(v=>v>1).sort((a,b)=>a-b);const med1=sorted1.length?sorted1[Math.floor(sorted1.length/2)]:0;const med2=sorted2.length?sorted2[Math.floor(sorted2.length/2)]:0;
+    /* DraftKings specifically (legacy compatibility) */
+    const dk1=books.draftkings?.p1||0,dk2=books.draftkings?.p2||0;
+    if(id1&&id2)pairs.push({id1,id2,name1:n1||String(id1),name2:n2||String(id2),dk1,dk2,best1,best2,best1Book,best2Book,med1,med2,books,p_tie,nBooks:Object.keys(books).length});
+  });return pairs;};
 
   const mergeAll=useCallback((decomp,preds,skills,odds,mp,ti)=>{
     const da=findArr(decomp)||[],pa=findArr(preds)||[],sa=findArr(skills)||[];
@@ -213,7 +266,7 @@ function App(){
     const merged=src.map(p=>{const id=p.dg_id||p.player_name;if(!id)return null;const sk=sm[id]||{},pr=pm[id]||{};
       const sg_dist=p.driving_distance_adjustment||0,sg_acc=p.driving_accuracy_adjustment||0;const sg_app=p.cf_approach_comp??p.approach??sk.sg_app??0,sg_arg=p.cf_short_comp??p.around_the_green??sk.sg_arg??0,sg_putt=p.putting_adjustment??p.putting??sk.sg_putt??0;
       const ch=p.course_history_adjustment||p.course_experience_adjustment||0,cf=p.total_fit_adjustment||0,rf=p.true_sg_adjustments||0;
-      const playerOdds={};MARKETS.forEach(mkt=>{const od=om[mkt]?.[id];if(!od)return;let best=0,bBook="";Object.entries(od).forEach(([k,v])=>{if(typeof v==="number"&&v>1&&KNOWN_BOOKS.some(b=>k.toLowerCase().replace(/[\s_]/g,"").includes(b))){if(v>best){best=v;bBook=k;}}});if(best>1)playerOdds[mkt]={bestOdds:best,bestBook:bBook};});
+      const playerOdds={};MARKETS.forEach(mkt=>{const od=om[mkt]?.[id];if(!od)return;const bookOdds={};/* { draftkings: 2.5, fanduel: 2.4, ... } */Object.entries(od).forEach(([k,v])=>{if(typeof v!=="number"||v<=1)return;const kl=k.toLowerCase().replace(/[\s_]/g,"");const matchedBook=KNOWN_BOOKS.find(b=>kl.includes(b));if(matchedBook&&(!bookOdds[matchedBook]||v>bookOdds[matchedBook]))bookOdds[matchedBook]=v;});const books=Object.entries(bookOdds);if(!books.length)return;let best=0,bBook="";books.forEach(([bk,v])=>{if(v>best){best=v;bBook=bk;}});const sortedO=books.map(([,v])=>v).sort((a,b)=>a-b);const median=sortedO.length?sortedO[Math.floor(sortedO.length/2)]:best;const dkOdds=bookOdds.draftkings||0;playerOdds[mkt]={bestOdds:best,bestBook:bBook,dkOdds,median,bookOdds,nBooks:books.length};});
       return{id,name:p.player_name||p.name||String(id),country:p.country||"",sg_dist,sg_acc,sg_app,sg_arg,sg_putt,sg_total:sg_dist+sg_acc+sg_app+sg_arg+sg_putt,baseline:p.baseline_pred||0,course_history_adj:ch,course_fit_adj:cf,recent_form_adj:rf,similar_course_adj:0,basket_rounds:0,dg_win:pr.win||0,dg_top5:pr.top_5||0,dg_top10:pr.top_10||0,dg_top20:pr.top_20||0,dg_make_cut:pr.make_cut||0,playerOdds};
     }).filter(p=>p&&(Math.abs(p.baseline)>0.001||p.dg_win>0||Math.abs(p.sg_total)>0.001));
     setPlayers(merged);setDs(d=>({...d,matchupPairs:mp||[]}));if(ti)setTourney(ti);setH2hData(null);
@@ -243,12 +296,13 @@ function App(){
 
   const doSim=useCallback(async()=>{if(!players.length)return;setSimRunning(true);await new Promise(r=>setTimeout(r,50));
     const w={sg_dist:sgW.dist/100,sg_acc:sgW.acc/100,sg_app:sgW.app/100,sg_arg:sgW.arg/100,sg_putt:sgW.putt/100,course_history:ctxW.ch/100,course_fit:ctxW.cf/100,recent_form:ctxW.rf/100,similar_course:ctxW.sc/100};
-    const {results,allScores:scores}=runSim(players,w,simCount);setSimRes(results);setAllScores(scores);
+    const {results,allScores:scores}=runSim(players,w,simCount,sigma);setSimRes(results);setAllScores(scores);
     if(scores&&ds.matchupPairs.length>0)setH2hData(computeH2H(scores,players,ds.matchupPairs.slice(0,300)));else setH2hData(null);
     setSimRunning(false);setTab("results");setSubTab("sim_results");
-    const e={id:Date.now(),date:new Date().toISOString(),t:tourney?.name,n:simCount,sg:{...sgW},cx:{...ctxW},top30:results.slice().sort((a,b)=>b.sim_win-a.sim_win).slice(0,30).map(p=>({id:p.id,n:p.name,w:p.sim_win,t5:p.sim_top5,t10:p.sim_top10,t20:p.sim_top20,mc:p.sim_make_cut})),allPlayers:results.slice().sort((a,b)=>b.sim_win-a.sim_win).slice(0,150).map(p=>({id:p.id,n:p.name,w:p.sim_win,t5:p.sim_top5,t10:p.sim_top10,t20:p.sim_top20,mc:p.sim_make_cut,af:p.avg_finish}))};
+    const sortedRes=results.slice().sort((a,b)=>b.sim_win-a.sim_win);
+    const e={id:Date.now(),date:new Date().toISOString(),t:tourney?.name,n:simCount,sg:{...sgW},cx:{...ctxW},sigma,top30:sortedRes.slice(0,30).map(p=>({id:p.id,n:p.name,w:p.sim_win,t5:p.sim_top5,t10:p.sim_top10,t20:p.sim_top20,mc:p.sim_make_cut})),allPlayers:sortedRes.slice(0,150).map(p=>({id:p.id,n:p.name,w:p.sim_win,t5:p.sim_top5,t10:p.sim_top10,t20:p.sim_top20,mc:p.sim_make_cut,af:p.avg_finish}))};
     const h=[e,...hist].slice(0,20);setHist(h);sSet("hist",h);
-  },[players,sgW,ctxW,simCount,tourney,hist,ds.matchupPairs]);
+  },[players,sgW,ctxW,simCount,tourney,hist,ds.matchupPairs,sigma]);
 
   const dgFetchRetry=async(path,params)=>{const apiK=apiKey||DG_KEY_HIST;const p={...params,key:params.key||apiK};for(let pi=0;pi<PROXIES.length;pi++){try{return await dgFetch(path,p,pi);}catch{}}throw new Error("All proxies failed");};
   const parseRoundsData=(d,extraFields={})=>{const raw=d?.scores||findArr(d);if(!raw?.length)return[];const rounds=[];raw.forEach(p=>{const finText=p.fin_text||p.finish_position||p.position||p.fin||"";let foundNested=false;for(let r=1;r<=4;r++){const rd=p["round_"+r];if(rd&&(rd.sg_app!==undefined||rd.sg_ott!==undefined)){foundNested=true;rounds.push({...rd,dg_id:p.dg_id,player_name:p.player_name,fin_text:finText,...extraFields});}}if(!foundNested&&(p.sg_app!==undefined||p.sg_ott!==undefined)){rounds.push({sg_ott:p.sg_ott||0,sg_app:p.sg_app||0,sg_arg:p.sg_arg||0,sg_putt:p.sg_putt||0,sg_total:p.sg_total||0,dg_id:p.dg_id,player_name:p.player_name,fin_text:finText,...extraFields});}});return rounds;};
@@ -325,7 +379,7 @@ function App(){
       setGradeStatus("✓ "+results.length+" players");
     }catch(e){setGradeStatus("Error: "+e.message+(e.message.includes("proxies")?" — try again in a minute or check your API key.":""));}setGradeLoading(false);};
 
-  /* ── Process pasted grading results JSON ── */
+  /* ── Paste-JSON fallback for grading (CORS proxies often fail) ── */
   const processGradePaste=()=>{if(!gradePasteText.trim())return;setGradeResults(null);setGradeCorr(null);
     try{const raw=JSON.parse(gradePasteText.trim());const rounds=parseRoundsData(raw);
       if(!rounds.length){setGradeStatus("No round data found in pasted JSON.");return;}
@@ -336,23 +390,73 @@ function App(){
       setGradeStatus("✓ "+results.length+" players (pasted)");setGradePasteText("");
     }catch(e){setGradeStatus("Paste error: "+e.message);}};
 
-  /* ── Name normalization for grading match ── */
+  /* ── Name normalization for three-pass grading match ── */
   const normName=n=>(n||"").toLowerCase().replace(/[^a-z]/g,"");
   const lastFirst=n=>{const parts=(n||"").split(/[\s,]+/).filter(Boolean);return parts.length>=2?normName(parts[parts.length-1]+parts[0]):normName(n);};
-  const buildGradeMap=(simPlayers)=>{const m={};(simPlayers||[]).forEach(p=>{m[p.id]=p;m[normName(p.n)]=p;m[lastFirst(p.n)]=p;});return m;};
+  const buildGradeMap=(simPlayers)=>{const m={};(simPlayers||[]).forEach(p=>{if(p.id)m[p.id]=p;if(p.n){m[normName(p.n)]=p;m[lastFirst(p.n)]=p;}});return m;};
+  const gradeMatchPlayer=(r,simMap)=>simMap[r.pid]||simMap[normName(r.name)]||simMap[lastFirst(r.name)];
 
   /* ── Apply optimal weights + context multipliers ── */
   const applyOptimal=()=>{if(!hwAggregate)return;const ott=hwAggregate.sg_ott||25;const d=Math.round(ott*OTT_DIST_RATIO);const a=ott-d;const app=hwAggregate.sg_app||25;const arg=hwAggregate.sg_arg||25;const putt=hwAggregate.sg_putt||25;const tot=d+a+app+arg+putt;const adj=100-tot;setSgW({dist:d,acc:a,app:app+adj,arg,putt});};
 
   const savePre=()=>{if(!pName.trim())return;const p={name:pName.trim(),sg:{...sgW},cx:{...ctxW}};const u=[...presets.filter(x=>x.name!==p.name),p];setPresets(u);sSet("presets",u);setPName("");};
   const sorted=useMemo(()=>simRes?[...simRes].sort((a,b)=>{const av=a[sort.col]??0,bv=b[sort.col]??0;return sort.dir==="desc"?bv-av:av-bv;}):[]     ,[simRes,sort]);
-  const evData=useMemo(()=>{if(!simRes)return[];const smk={win:"sim_win",top_5:"sim_top5",top_10:"sim_top10",top_20:"sim_top20",make_cut:"sim_make_cut"};return simRes.map(p=>{const ev={};MARKETS.forEach(m=>{const od=p.playerOdds?.[m];if(od?.bestOdds>1){const imp=decToImp(od.bestOdds);const sp=p[smk[m]]||0;ev["ev_"+m]=sp-imp;ev["sim_"+m]=sp;ev["imp_"+m]=imp;ev["odds_"+m]=od.bestOdds;ev["kelly_"+m]=kellyBet(sp,od.bestOdds,kellyFrac,bankroll);}});return{...p,...ev};}).sort((a,b)=>{const av=a[evS.col]??-999,bv=b[evS.col]??-999;return evS.dir==="desc"?bv-av:av-bv;});},[simRes,evS,kellyFrac,bankroll]);
-  const matchupRows=useMemo(()=>{if(!h2hData||!ds.matchupPairs?.length)return[];return ds.matchupPairs.slice(0,300).map(m=>{const s1=h2hData[m.id1+"_"+m.id2]??null,s2=s1!=null?1-s1:null;const i1=decToImp(m.dk1),i2=decToImp(m.dk2);const ev1=s1!=null&&i1>0?s1-i1:null,ev2=s2!=null&&i2>0?s2-i2:null;const k1=ev1>0&&m.dk1>1?kellyBet(s1,m.dk1,kellyFrac,bankroll):0;const k2=ev2>0&&m.dk2>1?kellyBet(s2,m.dk2,kellyFrac,bankroll):0;return{...m,s1,s2,i1,i2,ev1,ev2,k1,k2,bestEV:Math.max(ev1||0,ev2||0)};}).sort((a,b)=>b.bestEV-a.bestEV);},[h2hData,ds.matchupPairs,kellyFrac,bankroll]);
+  const evData=useMemo(()=>{if(!simRes)return[];
+    const smk={win:"sim_win",top_5:"sim_top5",top_10:"sim_top10",top_20:"sim_top20",make_cut:"sim_make_cut"};
+    const oddsKey=oddsMode==="best"?"bestOdds":oddsMode==="median"?"median":"dkOdds";
+    /* Build per-market devig lookup */
+    const devigByMkt={};MARKETS.forEach(m=>{const impls=simRes.map(p=>{const od=p.playerOdds?.[m];return(od?.[oddsKey]>1)?decToImp(od[oddsKey]):0;});const sum=impls.reduce((a,b)=>a+b,0);devigByMkt[m]={sum,impls};});
+    return simRes.map((p,pi)=>{const ev={};MARKETS.forEach(m=>{const od=p.playerOdds?.[m];const dec=od?.[oddsKey];if(!od||!dec||dec<=1)return;
+      const imp=decToImp(dec);const sp=p[smk[m]]||0;
+      /* De-vigged implied prob */
+      const sum=devigByMkt[m].sum;const impDevig=(devigOn&&sum>0)?imp/sum:imp;
+      /* Proper EV: p * dec - 1 (equivalent math, but against devigged comparison we use diff in prob) */
+      const ev_pp=sp-imp;/* legacy percentage-point EV (raw, no devig) */
+      const ev_devig=sp-impDevig;/* devigged percentage-point edge */
+      const ev_true=sp*dec-1;/* true EV per unit staked */
+      /* Qualification: CI-lower > impDevig + minEV threshold */
+      const ciVal=ci95(sp,simCount||10000);const spLow=Math.max(0,sp-ciVal);
+      const edgeLow=spLow-impDevig;
+      const threshold=minEV[m]||0;
+      const qualified=useCIFilter?(edgeLow>=threshold):((ev_devig)>=threshold);
+      const kellyUsed=qualified?kellyBet(sp,dec,kellyFrac,bankroll):0;
+      ev["sim_"+m]=sp;ev["imp_"+m]=imp;ev["impDevig_"+m]=impDevig;ev["odds_"+m]=dec;ev["oddsBook_"+m]=oddsMode==="dk"?"DK":oddsMode==="best"?(od.bestBook||""):"MED";
+      ev["ev_"+m]=devigOn?ev_devig:ev_pp;/* shown in table */
+      ev["evTrue_"+m]=ev_true;ev["evRaw_"+m]=ev_pp;ev["ciLow_"+m]=spLow;ev["edgeLow_"+m]=edgeLow;ev["qualified_"+m]=qualified;ev["kelly_"+m]=kellyUsed;ev["nBooks_"+m]=od.nBooks||1;
+    });return{...p,...ev};}).sort((a,b)=>{const av=a[evS.col]??-999,bv=b[evS.col]??-999;return evS.dir==="desc"?bv-av:av-bv;});
+  },[simRes,evS,kellyFrac,bankroll,oddsMode,devigOn,useCIFilter,minEV,simCount]);
+  const matchupRows=useMemo(()=>{if(!h2hData||!ds.matchupPairs?.length)return[];
+    return ds.matchupPairs.slice(0,300).map(m=>{
+      const s1Raw=h2hData[m.id1+"_"+m.id2]??null;const s2Raw=s1Raw!=null?1-s1Raw:null;
+      const p_tie=m.p_tie||0;
+      /* Adjust sim probabilities to account for ties: scale both by (1 - p_tie) */
+      const s1=s1Raw!=null?s1Raw*(1-p_tie):null;const s2=s2Raw!=null?s2Raw*(1-p_tie):null;
+      /* Choose odds based on mode */
+      const dec1=oddsMode==="best"?m.best1:oddsMode==="median"?m.med1:m.dk1;
+      const dec2=oddsMode==="best"?m.best2:oddsMode==="median"?m.med2:m.dk2;
+      const book1=oddsMode==="best"?m.best1Book:oddsMode==="median"?"MED":"DK";
+      const book2=oddsMode==="best"?m.best2Book:oddsMode==="median"?"MED":"DK";
+      /* Proper matchup EV: p_win * (odds-1) - p_loss (ties void on most PGA matchups) */
+      const ev1=(s1!=null&&dec1>1)?matchupEV(s1,dec1,p_tie):null;
+      const ev2=(s2!=null&&dec2>1)?matchupEV(s2,dec2,p_tie):null;
+      /* De-vigged implied for two-way with tie scaling */
+      const i1Raw=dec1>1?decToImp(dec1):0,i2Raw=dec2>1?decToImp(dec2):0;
+      const iSum=i1Raw+i2Raw;const i1Devig=devigOn&&iSum>0?i1Raw/iSum*(1-p_tie):i1Raw;const i2Devig=devigOn&&iSum>0?i2Raw/iSum*(1-p_tie):i2Raw;
+      /* CI-based qualification */
+      const ciV=ci95(s1||0,simCount||10000);const s1Low=Math.max(0,(s1||0)-ciV);const s2Low=Math.max(0,(s2||0)-ciV);
+      const thr=minEV.matchup||0.03;
+      const q1=useCIFilter?(s1Low-i1Devig>=thr):((s1||0)-i1Devig>=thr);
+      const q2=useCIFilter?(s2Low-i2Devig>=thr):((s2||0)-i2Devig>=thr);
+      const k1=q1&&dec1>1?kellyBet(s1,dec1,kellyFrac,bankroll):0;
+      const k2=q2&&dec2>1?kellyBet(s2,dec2,kellyFrac,bankroll):0;
+      return{...m,s1,s2,s1Raw,s2Raw,i1Devig,i2Devig,dec1,dec2,book1,book2,ev1,ev2,k1,k2,q1,q2,bestEV:Math.max(ev1||-99,ev2||-99)};
+    }).sort((a,b)=>b.bestEV-a.bestEV);
+  },[h2hData,ds.matchupPairs,kellyFrac,bankroll,oddsMode,devigOn,useCIFilter,minEV,simCount]);
   const dSt={decomp:!!(findArr(ds.decomp)?.length),preds:!!(findArr(ds.preds)?.length),skills:!!(findArr(ds.skills)?.length),odds:Object.keys(ds.odds||{}).filter(k=>(findArr(ds.odds[k])||[]).length>0),matchups:ds.matchupPairs?.length||0};
   const hasOdds=dSt.odds.length>0;
   const tSort=(col,def="desc")=>setSort(s=>s.col===col?{...s,dir:s.dir==="desc"?"asc":"desc"}:{col,dir:def});
   const toggleCmp=(hid)=>setCompareItems(ci=>ci.includes(hid)?ci.filter(x=>x!==hid):ci.length>=2?[ci[1],hid]:[...ci,hid]);
-  const compareData=useMemo(()=>{if(compareItems.length<2)return null;const [a,b]=[hist.find(h=>h.id===compareItems[0]),hist.find(h=>h.id===compareItems[1])];if(!a||!b)return null;const aP=a.allPlayers||a.top30||[];const bP=b.allPlayers||b.top30||[];const bMap={};bP.forEach(p=>bMap[p.id]=p);return{a,b,rows:aP.map(p=>{const bp=bMap[p.id]||{};return{name:p.n,aW:p.w,bW:bp.w||0,dW:(p.w||0)-(bp.w||0)};}).sort((a,b)=>b.aW-a.aW)};},[compareItems,hist]);
+  const compareData=useMemo(()=>{if(compareItems.length<2)return null;const [a,b]=[hist.find(h=>h.id===compareItems[0]),hist.find(h=>h.id===compareItems[1])];if(!a||!b)return null;const bMap={};b.top30?.forEach(p=>bMap[p.id]=p);return{a,b,rows:(a.top30||[]).map(p=>{const bp=bMap[p.id]||{};return{name:p.n,aW:p.w,bW:bp.w||0,dW:(p.w||0)-(bp.w||0)};}).sort((a,b)=>b.aW-a.aW)};},[compareItems,hist]);
   const csvRes=()=>{if(!sorted.length)return;downloadCSV(sorted.map(p=>({Name:p.name,Win:pFmt(p.sim_win),Top5:pFmt(p.sim_top5),Top10:pFmt(p.sim_top10),Top20:pFmt(p.sim_top20),Cut:pFmt(p.sim_make_cut),AvgPos:p.avg_finish?.toFixed(1)})),"results.csv");};
   const csvEV=()=>{if(!evData.length)return;downloadCSV(evData.filter(p=>MARKETS.some(m=>p["ev_"+m]!=null)).map(p=>({Name:p.name,...Object.fromEntries(MARKETS.flatMap(m=>[["EV_"+m,evFmt(p["ev_"+m])],["Kelly$_"+m,p["kelly_"+m]?.toFixed(2)||""]]))})),"ev.csv");};
   const handleCSVUpload=(e)=>{const file=e.target.files?.[0];if(!file)return;const reader=new FileReader();reader.onload=(ev)=>{const data=parseCSV(ev.target.result);if(data.length>0){setCourseCSV(data);sSet("courseCSV",data);}};reader.readAsText(file);};
@@ -368,7 +472,7 @@ function App(){
   const RESULT_SUBS=[["sim_results","Results"],["ev","EV Analysis"],["matchups","Matchups"],["history","History"]];
 
   return(<div style={S.root}>
-    <div style={S.header}><div style={S.hL}><div style={S.logo}>◆</div><div><h1 style={S.title}>PGA Tournament Simulator <span style={{fontSize:9,color:"#22d3ee",background:"#164e63",padding:"1px 6px",borderRadius:3}}>v4.9</span></h1><div style={S.sub}>{tourney?tourney.name+" · "+tourney.course:"Course Intel · Field Analysis · Monte Carlo · Grading"}</div></div></div>
+    <div style={S.header}><div style={S.hL}><div style={S.logo}>◆</div><div><h1 style={S.title}>PGA Tournament Simulator <span style={{fontSize:9,color:"#22d3ee",background:"#164e63",padding:"1px 6px",borderRadius:3}}>v5.0</span></h1><div style={S.sub}>{tourney?tourney.name+" · "+tourney.course:"Course Intel · Field Analysis · Monte Carlo · Grading"}</div></div></div>
       <div style={S.badges}>{players.length>0&&<span style={S.badge}>{players.length} players</span>}{simRes&&<span style={S.badge}>{simCount.toLocaleString()} sims</span>}{courseCSV&&<span style={{...S.badge,color:"#a78bfa",borderColor:"#7c3aed"}}>{courseCSV.length} courses</span>}</div></div>
     <div style={S.tabs}>{TABS.map(([id,lb,en])=>(<button key={id} disabled={!en} onClick={()=>{setTab(id);if(id==="results")setSubTab("sim_results");}} style={{...S.tab,...(tab===id?S.tabOn:{}),...(!en?S.tabOff:{})}}>{lb}</button>))}</div>
     {tab==="results"&&<div style={S.subTabs}>{RESULT_SUBS.map(([id,lb])=>(<button key={id} onClick={()=>setSubTab(id)} style={{...S.subTab,...(subTab===id?S.subTabOn:{})}}>{lb}</button>))}</div>}
@@ -482,6 +586,10 @@ function App(){
           <h2 style={S.h2}>Context Multipliers <span style={{fontSize:10,color:"#64748b",fontWeight:400}}>(0–200%)</span></h2>
           {[{k:"ch",l:"Course History"},{k:"cf",l:"Course Fit"},{k:"rf",l:"Recent Form"},{k:"sc",l:"AV Basket Fit",color:"#f59e0b"}].map(s=>(<div key={s.k} style={S.slG}><div style={S.slH}><span style={{...S.slL,color:s.color||"#e2e8f0"}}>{s.l}</span><span style={{...S.slV,color:s.color||"#22d3ee"}}>{ctxW[s.k]}%</span></div><input type="range" min={0} max={200} value={ctxW[s.k]} onChange={e=>setCtxW(w=>({...w,[s.k]:+e.target.value}))} style={S.slider}/></div>))}
           <div style={{...S.dv,margin:"16px 0"}}/>
+          <h2 style={S.h2}>Round Volatility (σ) <span style={{fontSize:10,color:"#64748b",fontWeight:400}}>default 3.0</span></h2>
+          <div style={{fontSize:10,color:"#94a3b8",marginBottom:8,padding:"6px 10px",background:"#0f172a",borderRadius:4,borderLeft:"3px solid "+(sigma<2.8?"#ef4444":sigma>3.3?"#f59e0b":"#22c55e")}}>Per-round score SD. Lower = favorites dominate. Higher = more parity. {sigma<2.8?"⚠ Below tour empirical range":sigma>3.3?"Conservative (flattens favorites)":"Within empirical range"}</div>
+          <div style={S.slG}><div style={S.slH}><span style={S.slL}>Sigma</span><span style={S.slV}>{sigma.toFixed(2)}</span></div><input type="range" min={2.5} max={3.5} step={0.05} value={sigma} onChange={e=>setSigma(+e.target.value)} style={S.slider}/></div>
+          <div style={{...S.dv,margin:"16px 0"}}/>
           <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:12}}>{SIM_COUNTS.map(c=>(<button key={c} onClick={()=>setSimCount_(c)} style={{...S.simBtn,...(simCount===c?S.simBtnOn:{})}}>{c.toLocaleString()}</button>))}</div>
           <button onClick={doSim} disabled={simRunning||!players.length} style={{...S.btnRun,opacity:(simRunning||!players.length)?0.6:1}}>{simRunning?"⏳ Running...":"▶ Run "+simCount.toLocaleString()+" Simulations"}</button>
         </div>
@@ -505,18 +613,107 @@ function App(){
         {!showAll&&sorted.length>100&&<button onClick={()=>setShowAll(true)} style={{...S.btnSm,marginTop:8}}>Show All {sorted.length}</button>}
       </div>}
       {subTab==="ev"&&simRes&&<div>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:8}}><h2 style={S.h2}>EV Analysis</h2><div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{fontSize:10,color:"#94a3b8"}}>Bankroll $</span><input type="number" value={bankroll} onChange={e=>setBankroll(+e.target.value)} style={{...S.inp,width:85,padding:"4px 7px",fontSize:11}} min={0}/><select value={kellyFrac} onChange={e=>setKellyFrac(+e.target.value)} style={{...S.inp,width:95,padding:"4px 7px",fontSize:11}}><option value={0.25}>¼ Kelly</option><option value={0.5}>½ Kelly</option><option value={1}>Full Kelly</option></select><button onClick={csvEV} style={S.btnSm}>⬇ CSV</button></div></div>
-        {!hasOdds&&<div style={S.warn}>No odds loaded.</div>}
-        {hasOdds&&<div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>Player</th>{dSt.odds.flatMap(m=>[<th key={m+"e"} style={{...S.th,cursor:"pointer",color:"#22d3ee"}} onClick={()=>setEvS(s=>s.col==="ev_"+m?{...s,dir:s.dir==="desc"?"asc":"desc"}:{col:"ev_"+m,dir:"desc"})}>{MARKET_LABELS[m]} EV</th>,<th key={m+"s"} style={S.th}>Sim%</th>,<th key={m+"k"} style={{...S.th,color:"#22d3ee"}}>Kelly $</th>])}</tr></thead><tbody>
-          {evData.filter(p=>MARKETS.some(m=>p["ev_"+m]!=null)).slice(0,100).map((p,i)=>(<tr key={p.id} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{p.name}</td>{dSt.odds.flatMap(m=>{const ev=p["ev_"+m],k=p["kelly_"+m];return[<td key={"e"+m} style={{...S.td,fontWeight:700,color:(ev||0)>0.01?"#22c55e":(ev||0)<-0.02?"#ef4444":"#94a3b8"}}>{evFmt(ev)}</td>,<td key={"s"+m} style={S.td}>{pFmt(p["sim_"+m])}</td>,<td key={"k"+m} style={{...S.td,color:k>0?"#22d3ee":"#334155"}}>{k>0?"$"+k.toFixed(2):"-"}</td>];})}</tr>))}
-        </tbody></table></div>}
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:6}}><h2 style={S.h2}>EV Analysis</h2>
+          <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>{MARKETS.map(m=>(<button key={m} onClick={()=>setEvMktTab(m)} style={{...S.simBtn,padding:"4px 9px",fontSize:10,...(evMktTab===m?S.simBtnOn:{})}}>{MARKET_LABELS[m]}</button>))}</div>
+        </div>
+        <BetControlsBar bankroll={bankroll} setBankroll={setBankroll} kellyFrac={kellyFrac} setKellyFrac={setKellyFrac} oddsMode={oddsMode} setOddsMode={setOddsMode} devigOn={devigOn} setDevigOn={setDevigOn} useCIFilter={useCIFilter} setUseCIFilter={setUseCIFilter} showOnlyQualified={showOnlyQualified} setShowOnlyQualified={setShowOnlyQualified} minEV={minEV} setMinEV={setMinEV} mkt={evMktTab} onExport={csvEV}/>
+        {!hasOdds&&<div style={S.warn}>No odds loaded. Fetch current tournament data or paste odds JSON on Setup tab.</div>}
+        {hasOdds&&(()=>{const m=evMktTab;const rows=evData.filter(p=>p["ev_"+m]!=null).filter(p=>!showOnlyQualified||p["qualified_"+m]).sort((a,b)=>(b["ev_"+m]||-99)-(a["ev_"+m]||-99));const qCount=evData.filter(p=>p["qualified_"+m]).length;
+          return<>
+            <div style={{fontSize:10,color:"#94a3b8",marginBottom:6,padding:"4px 10px",background:"#0a0e17",borderRadius:4,display:"flex",gap:12,flexWrap:"wrap"}}>
+              <span><b style={{color:"#22c55e"}}>{qCount}</b> qualified bets</span>
+              <span style={{color:"#64748b"}}>|</span>
+              <span>Min EV: <b style={{color:"#22d3ee"}}>{((minEV[m]||0)*100).toFixed(1)}%</b></span>
+              <span style={{color:"#64748b"}}>|</span>
+              <span>σ = {sigma.toFixed(2)}</span>
+              <span style={{color:"#64748b"}}>|</span>
+              <span>{devigOn?"De-vigged":"Raw"} implied · {useCIFilter?"CI-95 lower bound":"Point estimate"}</span>
+            </div>
+            <div style={S.tW}><table style={S.table}><thead><tr>
+              <th style={S.th}>#</th>
+              <th style={{...S.th,textAlign:"left"}}>Player</th>
+              <th style={S.th}>Sim%</th>
+              <th style={S.th}>CI-Low</th>
+              <th style={S.th}>{devigOn?"Dev Imp":"Imp"}</th>
+              <th style={S.th}>Odds</th>
+              <th style={S.th}>Book</th>
+              <th style={{...S.th,color:"#22d3ee"}}>Edge</th>
+              <th style={S.th}>True EV</th>
+              <th style={S.th}>Qual</th>
+              <th style={{...S.th,color:"#22d3ee"}}>Kelly $</th>
+            </tr></thead><tbody>
+              {rows.slice(0,100).map((p,i)=>{const ev=p["ev_"+m],sp=p["sim_"+m],low=p["ciLow_"+m],imp=p["impDevig_"+m],odd=p["odds_"+m],bk=p["oddsBook_"+m],trueEv=p["evTrue_"+m],k=p["kelly_"+m],q=p["qualified_"+m];
+                return<tr key={p.id} style={{...(i%2?S.trO:S.trE),...(q?{borderLeft:"3px solid #22c55e"}:{})}}>
+                  <td style={S.tdR}>{i+1}</td>
+                  <td style={S.tdN}>{p.name}</td>
+                  <td style={S.tdH}>{pFmtS(sp)}</td>
+                  <td style={{...S.td,color:"#64748b",fontSize:9}}>{pFmtS(low)}</td>
+                  <td style={{...S.td,color:"#94a3b8"}}>{pFmtS(imp)}</td>
+                  <td style={S.td}>{odd?.toFixed(2)}</td>
+                  <td style={{...S.tdD,fontSize:9}}>{(bk||"").slice(0,3).toUpperCase()}</td>
+                  <td style={{...S.td,fontWeight:700,color:(ev||0)>0.05?"#22c55e":(ev||0)>0?"#4ade80":(ev||0)<-0.02?"#ef4444":"#94a3b8"}}>{evFmt(ev)}</td>
+                  <td style={{...S.td,color:(trueEv||0)>0?"#22c55e":"#94a3b8"}}>{trueEv!=null?((trueEv>0?"+":"")+(trueEv*100).toFixed(1)+"%"):"-"}</td>
+                  <td style={S.td}>{q?<span style={{color:"#22c55e",fontWeight:700}}>✓</span>:<span style={{color:"#475569"}}>—</span>}</td>
+                  <td style={{...S.td,color:k>0?"#22d3ee":"#334155",fontWeight:k>0?700:400}}>{k>0?"$"+k.toFixed(2):"-"}</td>
+                </tr>;})}
+            </tbody></table></div>
+            {rows.length===0&&<div style={{padding:14,fontSize:11,color:"#94a3b8",textAlign:"center"}}>No rows match the current filters. Try disabling "Qualified only" or lowering Min EV.</div>}
+          </>;})()}
       </div>}
       {subTab==="matchups"&&simRes&&<div>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,marginBottom:8}}><h2 style={S.h2}>Matchup EV</h2><div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{fontSize:10,color:"#94a3b8"}}>Bankroll $</span><input type="number" value={bankroll} onChange={e=>setBankroll(+e.target.value)} style={{...S.inp,width:85,padding:"4px 7px",fontSize:11}} min={0}/><select value={kellyFrac} onChange={e=>setKellyFrac(+e.target.value)} style={{...S.inp,width:95,padding:"4px 7px",fontSize:11}}><option value={0.25}>¼ Kelly</option><option value={0.5}>½ Kelly</option><option value={1}>Full Kelly</option></select></div></div>
-        {!h2hData&&<div style={S.warn}>Run sim ≤{MAX_STORE.toLocaleString()} iters for H2H.</div>}
-        {h2hData&&matchupRows.length>0&&<div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>#</th><th style={{...S.th,textAlign:"left"}}>P1</th><th style={S.th}>Sim%</th><th style={S.th}>EV</th><th style={S.th}>Kelly</th><th style={{...S.th,textAlign:"left"}}>P2</th><th style={S.th}>Sim%</th><th style={S.th}>EV</th><th style={S.th}>Kelly</th></tr></thead><tbody>
-          {matchupRows.slice(0,100).map((m,i)=>(<tr key={i} style={i%2?S.trO:S.trE}><td style={S.tdR}>{i+1}</td><td style={S.tdN}>{m.name1}</td><td style={S.td}>{m.s1!=null?pFmtS(m.s1):"-"}</td><td style={{...S.td,fontWeight:700,color:(m.ev1||0)>0.01?"#22c55e":"#94a3b8"}}>{evFmt(m.ev1)}</td><td style={{...S.td,color:m.k1>0?"#22d3ee":"#334155"}}>{m.k1>0?"$"+m.k1.toFixed(2):"-"}</td><td style={S.tdN}>{m.name2}</td><td style={S.td}>{m.s2!=null?pFmtS(m.s2):"-"}</td><td style={{...S.td,fontWeight:700,color:(m.ev2||0)>0.01?"#22c55e":"#94a3b8"}}>{evFmt(m.ev2)}</td><td style={{...S.td,color:m.k2>0?"#22d3ee":"#334155"}}>{m.k2>0?"$"+m.k2.toFixed(2):"-"}</td></tr>))}
-        </tbody></table></div>}
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,marginBottom:6}}><h2 style={S.h2}>Matchup EV</h2>
+          <div style={{fontSize:10,color:"#64748b"}}>{ds.matchupPairs.length} pairs loaded{ds.matchupPairs.length>0?" · "+(ds.matchupPairs[0]?.nBooks||1)+" books parsed":""}</div>
+        </div>
+        <BetControlsBar bankroll={bankroll} setBankroll={setBankroll} kellyFrac={kellyFrac} setKellyFrac={setKellyFrac} oddsMode={oddsMode} setOddsMode={setOddsMode} devigOn={devigOn} setDevigOn={setDevigOn} useCIFilter={useCIFilter} setUseCIFilter={setUseCIFilter} showOnlyQualified={showOnlyQualified} setShowOnlyQualified={setShowOnlyQualified} minEV={minEV} setMinEV={setMinEV} mkt="matchup"/>
+        {!ds.matchupPairs?.length&&<div style={S.warn}>No matchup data loaded. Fetch current tournament data on Setup tab or paste the matchups JSON — DataGolf endpoint: <code style={{fontSize:10,color:"#22d3ee"}}>/betting-tools/matchups?tour=pga&market=tournament_matchups&odds_format=decimal</code></div>}
+        {ds.matchupPairs?.length>0&&!h2hData&&<div style={S.warn}>Run simulation at ≤{MAX_STORE.toLocaleString()} iters to generate head-to-head probabilities.</div>}
+        {h2hData&&matchupRows.length>0&&(()=>{const rows=showOnlyQualified?matchupRows.filter(m=>m.q1||m.q2):matchupRows;const qCount=matchupRows.filter(m=>m.q1||m.q2).length;
+          return<>
+            <div style={{fontSize:10,color:"#94a3b8",marginBottom:6,padding:"4px 10px",background:"#0a0e17",borderRadius:4,display:"flex",gap:12,flexWrap:"wrap"}}>
+              <span><b style={{color:"#22c55e"}}>{qCount}</b> qualified matchups (of {matchupRows.length})</span>
+              <span style={{color:"#64748b"}}>|</span>
+              <span>Min EV: <b style={{color:"#22d3ee"}}>{((minEV.matchup||0)*100).toFixed(1)}%</b></span>
+              <span style={{color:"#64748b"}}>|</span>
+              <span>EV formula: p_win × (odds−1) − p_loss {matchupRows.some(m=>m.p_tie>0)?"· ties modeled":""}</span>
+            </div>
+            <div style={S.tW}><table style={S.table}><thead><tr>
+              <th style={S.th}>#</th>
+              <th style={{...S.th,textAlign:"left"}}>P1</th>
+              <th style={S.th}>Sim%</th>
+              <th style={S.th}>Odds</th>
+              <th style={S.th}>Bk</th>
+              <th style={{...S.th,color:"#22d3ee"}}>EV</th>
+              <th style={S.th}>Q</th>
+              <th style={{...S.th,color:"#22d3ee"}}>Kelly</th>
+              <th style={{...S.th,textAlign:"left"}}>P2</th>
+              <th style={S.th}>Sim%</th>
+              <th style={S.th}>Odds</th>
+              <th style={S.th}>Bk</th>
+              <th style={{...S.th,color:"#22d3ee"}}>EV</th>
+              <th style={S.th}>Q</th>
+              <th style={{...S.th,color:"#22d3ee"}}>Kelly</th>
+            </tr></thead><tbody>
+              {rows.slice(0,150).map((m,i)=>{const q=m.q1||m.q2;
+                return<tr key={i} style={{...(i%2?S.trO:S.trE),...(q?{borderLeft:"3px solid #22c55e"}:{})}}>
+                  <td style={S.tdR}>{i+1}</td>
+                  <td style={{...S.tdN,color:m.q1?"#22c55e":"#f1f5f9"}}>{m.name1}</td>
+                  <td style={S.tdH}>{m.s1!=null?pFmtS(m.s1):"-"}</td>
+                  <td style={S.td}>{m.dec1>1?m.dec1.toFixed(2):"-"}</td>
+                  <td style={{...S.tdD,fontSize:9}}>{(m.book1||"").slice(0,3).toUpperCase()}</td>
+                  <td style={{...S.td,fontWeight:700,color:(m.ev1||0)>0.03?"#22c55e":(m.ev1||0)>0?"#4ade80":"#94a3b8"}}>{m.ev1!=null?((m.ev1>0?"+":"")+(m.ev1*100).toFixed(1)+"%"):"-"}</td>
+                  <td style={S.td}>{m.q1?<span style={{color:"#22c55e",fontWeight:700}}>✓</span>:<span style={{color:"#475569"}}>—</span>}</td>
+                  <td style={{...S.td,color:m.k1>0?"#22d3ee":"#334155",fontWeight:m.k1>0?700:400}}>{m.k1>0?"$"+m.k1.toFixed(2):"-"}</td>
+                  <td style={{...S.tdN,color:m.q2?"#22c55e":"#f1f5f9"}}>{m.name2}</td>
+                  <td style={S.tdH}>{m.s2!=null?pFmtS(m.s2):"-"}</td>
+                  <td style={S.td}>{m.dec2>1?m.dec2.toFixed(2):"-"}</td>
+                  <td style={{...S.tdD,fontSize:9}}>{(m.book2||"").slice(0,3).toUpperCase()}</td>
+                  <td style={{...S.td,fontWeight:700,color:(m.ev2||0)>0.03?"#22c55e":(m.ev2||0)>0?"#4ade80":"#94a3b8"}}>{m.ev2!=null?((m.ev2>0?"+":"")+(m.ev2*100).toFixed(1)+"%"):"-"}</td>
+                  <td style={S.td}>{m.q2?<span style={{color:"#22c55e",fontWeight:700}}>✓</span>:<span style={{color:"#475569"}}>—</span>}</td>
+                  <td style={{...S.td,color:m.k2>0?"#22d3ee":"#334155",fontWeight:m.k2>0?700:400}}>{m.k2>0?"$"+m.k2.toFixed(2):"-"}</td>
+                </tr>;})}
+            </tbody></table></div>
+            {rows.length===0&&<div style={{padding:14,fontSize:11,color:"#94a3b8",textAlign:"center"}}>No matchups match the filters. Disable "Qualified only" or lower Min EV.</div>}
+          </>;})()}
       </div>}
       {subTab==="history"&&<div>
         <h2 style={S.h2}>Simulation History</h2>
@@ -527,106 +724,98 @@ function App(){
         {!hist.length&&<div style={S.empty}>No simulations yet.</div>}
         {hist.map(h=>{const isSel=compareItems.includes(h.id);const si=compareItems.indexOf(h.id);return(<div key={h.id} style={{...S.hCard,borderLeft:"3px solid "+(isSel?"#22d3ee":"#1e293b")}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}><span style={{fontSize:13,fontWeight:700,color:"#e2e8f0"}}>{h.t||"Tournament"}</span><div style={{display:"flex",gap:4}}><button onClick={()=>toggleCmp(h.id)} style={{...S.btnSm,fontSize:9,background:isSel?"#1e3a5f":"#1e293b",color:isSel?"#22d3ee":"#94a3b8"}}>{isSel?"✓ "+(si===0?"A":"B"):"Compare"}</button><button onClick={()=>{setSgW(h.sg);setCtxW(prev=>({...prev,...h.cx}));setTab("simulation");}} style={{...S.btnSm,fontSize:9}}>↺ Reload</button></div></div>
           <div style={{fontSize:10,color:"#64748b"}}>{new Date(h.date).toLocaleString()} · {h.n?.toLocaleString()} sims</div>
-          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:4}}>{(h.allPlayers||h.top30||[]).slice(0,5).map((t,j)=>(<span key={j} style={S.hP}>{j+1}. {t.n} ({(t.w*100).toFixed(1)}%)</span>))}</div></div>);})}
+          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:4}}>{h.top30?.slice(0,5).map((t,j)=>(<span key={j} style={S.hP}>{j+1}. {t.n} ({(t.w*100).toFixed(1)}%)</span>))}</div></div>);})}
       </div>}
     </div>}
 
     {/* ═══ GRADING ═══ */}
     {tab==="grading"&&<div style={S.panel}>
       <h2 style={S.h2}>Post-Tournament Grading</h2>
-      <div style={S.section}><h3 style={S.h3}>Select Simulation</h3><select value={gradingSim?.id||""} onChange={e=>{const h=hist.find(x=>x.id===+e.target.value);setGradingSim(h||null);}} style={{...S.inp,maxWidth:500,marginBottom:10}}><option value="">Choose...</option>{hist.map(h=><option key={h.id} value={h.id}>{h.t} — {new Date(h.date).toLocaleDateString()} — {h.n?.toLocaleString()} sims{h.allPlayers?" · "+h.allPlayers.length+"p":" · "+((h.top30||[]).length)+"p"}</option>)}</select>
-        {gradingSim&&<div style={{fontSize:10,color:"#64748b",marginTop:4}}>Players stored: <b style={{color:"#e2e8f0"}}>{(gradingSim.allPlayers||gradingSim.top30||[]).length}</b>{!gradingSim.allPlayers&&<span style={{color:"#f59e0b"}}> (legacy sim — only top 30 saved. Re-run sim for full field grading.)</span>}</div>}
+      <div style={S.section}><h3 style={S.h3}>Select Simulation</h3><select value={gradingSim?.id||""} onChange={e=>{const h=hist.find(x=>x.id===+e.target.value);setGradingSim(h||null);}} style={{...S.inp,maxWidth:500,marginBottom:10}}><option value="">Choose...</option>{hist.map(h=><option key={h.id} value={h.id}>{h.t} — {new Date(h.date).toLocaleDateString()} — {h.n?.toLocaleString()} sims{h.allPlayers?" (full field)":" (top 30 only)"}</option>)}</select>
+        {gradingSim&&!gradingSim.allPlayers&&<div style={{fontSize:10,color:"#f59e0b",marginTop:3}}>⚠ Legacy sim — only top 30 players saved. Future sims will store top 150.</div>}
       </div>
 
-      <div style={S.section}><h3 style={S.h3}>Fetch Results</h3>
-        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}>
-          {!eventList&&<span style={{fontSize:11,color:"#f59e0b"}}>⚠ Load Event List on Setup tab</span>}
-          {eventList&&<select value={gradeEventId||""} onChange={e=>{const eid=e.target.value;setGradeEventId(eid);if(!gradeYear)setGradeYear(String(new Date().getFullYear()));}} style={{...S.inp,maxWidth:400}}><option value="">Select tournament...</option>{eventList.map((ev,i)=><option key={i} value={ev.event_id||""}>{fmtEventLabel(ev)}</option>)}</select>}
-          {gradeEventId&&<input type="number" value={gradeYear} onChange={e=>setGradeYear(e.target.value)} style={{...S.inp,flex:"none",width:70,textAlign:"center"}} title="Year to fetch"/>}
-          {eventList&&<button onClick={fetchGradeResults} disabled={gradeLoading||!gradeEventId} style={{...S.btnP,opacity:gradeLoading?0.5:1}}>{gradeLoading?"⏳":"Fetch"}</button>}
-          {gradeEventId&&apiKey&&<button onClick={()=>window.open(DG_BASE+"/historical-raw-data/rounds?tour=pga&event_id="+gradeEventId+"&year="+gradeYear+"&file_format=json&key="+apiKey,"_blank")} style={{...S.btnSm,background:"#1e293b",color:"#94a3b8"}}>Open ↗</button>}
+      <div style={S.section}><h3 style={S.h3}>Fetch Results</h3><div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}>
+        {!eventList&&<span style={{fontSize:11,color:"#f59e0b"}}>⚠ Load Event List on Setup tab</span>}
+        {eventList&&<select value={gradeEventId||""} onChange={e=>{const eid=e.target.value;setGradeEventId(eid);if(!gradeYear)setGradeYear(String(new Date().getFullYear()));}} style={{...S.inp,maxWidth:400}}><option value="">Select tournament...</option>{eventList.map((ev,i)=><option key={i} value={ev.event_id||""}>{fmtEventLabel(ev)}</option>)}</select>}
+        {gradeEventId&&<input type="number" value={gradeYear} onChange={e=>setGradeYear(e.target.value)} style={{...S.inp,flex:"none",width:70,textAlign:"center"}} title="Year to fetch"/>}
+        {eventList&&<button onClick={fetchGradeResults} disabled={gradeLoading||!gradeEventId} style={{...S.btnP,opacity:gradeLoading?0.5:1}}>{gradeLoading?"⏳":"Fetch"}</button>}
+        {gradeEventId&&apiKey&&<button onClick={()=>window.open(DG_BASE+"/historical-raw-data/rounds?tour=pga&event_id="+gradeEventId+"&year="+gradeYear+"&file_format=json&key="+apiKey,"_blank")} style={S.btnSm}>Open ↗</button>}
         </div>
-        {gradeStatus&&<div style={{fontSize:11,color:gradeStatus.startsWith("✓")?"#22c55e":gradeStatus.startsWith("Error")?"#fca5a5":"#94a3b8"}}>{gradeStatus}</div>}
-
-        {/* Paste fallback */}
-        {!gradeResults&&<div style={{marginTop:12}}>
-          <div style={{fontSize:10,color:"#64748b",marginBottom:4}}>If Fetch fails: open the URL above ↗, copy the JSON, and paste it here.</div>
-          <div style={{position:"relative"}}><textarea value={gradePasteText} onChange={e=>setGradePasteText(e.target.value)} rows={3} placeholder="Paste DataGolf historical-raw-data/rounds JSON here..." style={{width:"100%",padding:"9px 11px",fontSize:11,fontFamily:"'JetBrains Mono',monospace",background:"#1e293b",color:"#e2e8f0",border:"1px solid #334155",borderRadius:5,outline:"none",resize:"vertical",boxSizing:"border-box"}}/>
-            {gradePasteText.trim()&&<button onClick={processGradePaste} style={{position:"absolute",bottom:8,right:8,padding:"4px 10px",fontSize:10,fontWeight:600,fontFamily:"inherit",background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:3,cursor:"pointer"}}>Process</button>}</div>
-        </div>}
-        {gradeResults&&<button onClick={()=>{setGradeResults(null);setGradeCorr(null);setGradeStatus("");}} style={{...S.btnSm,fontSize:9,background:"#7f1d1d",color:"#fca5a5",marginTop:6}}>Clear Results</button>}
+        {gradeStatus&&<div style={{fontSize:11,color:gradeStatus.startsWith("✓")?"#22c55e":gradeStatus.includes("Error")?"#fca5a5":"#94a3b8"}}>{gradeStatus}</div>}
+        <div style={{marginTop:10,padding:"8px 10px",background:"#0a0e17",border:"1px solid #1e293b",borderRadius:5}}>
+          <div style={{fontSize:10,color:"#94a3b8",marginBottom:4}}>If fetch fails, click <b style={{color:"#22d3ee"}}>Open ↗</b> above, copy the JSON from that tab, and paste it here:</div>
+          <div style={{position:"relative"}}><textarea value={gradePasteText} onChange={e=>setGradePasteText(e.target.value)} rows={3} placeholder="Paste DataGolf historical-raw-data/rounds JSON here..." style={{width:"100%",padding:"8px 10px",fontSize:10,fontFamily:"'JetBrains Mono',monospace",background:"#1e293b",color:"#e2e8f0",border:"1px solid #334155",borderRadius:4,outline:"none",resize:"vertical",boxSizing:"border-box"}}/>
+            {gradePasteText.trim()&&<button onClick={processGradePaste} style={{position:"absolute",bottom:6,right:6,padding:"3px 9px",fontSize:9,fontWeight:600,background:"#22d3ee",color:"#0a0e17",border:"none",borderRadius:3,cursor:"pointer"}}>Process</button>}
+          </div>
+        </div>
       </div>
 
-      {/* ── Projection vs Actual ── */}
       {gradingSim&&gradeResults&&(()=>{
-        const simPlayers=gradingSim.allPlayers||gradingSim.top30||[];
-        const simMap=buildGradeMap(simPlayers);
-        /* Build sim rank map */
-        const simRanked=[...simPlayers].sort((a,b)=>b.w-a.w);
-        const simRankMap={};simRanked.forEach((p,i)=>{simRankMap[p.id]=i+1;simRankMap[normName(p.n)]=i+1;simRankMap[lastFirst(p.n)]=i+1;});
-
-        const matched=gradeResults.filter(r=>simMap[r.pid]||simMap[normName(r.name)]||simMap[lastFirst(r.name)]).map(r=>{
-          const sp=simMap[r.pid]||simMap[normName(r.name)]||simMap[lastFirst(r.name)];
-          const simRank=simRankMap[sp.id]||simRankMap[normName(sp.n)]||"—";
-          return{name:r.name,finish:r.finish,simWin:sp?.w||0,simT5:sp?.t5||0,simT10:sp?.t10||0,simT20:sp?.t20||0,simMC:sp?.mc||0,simAvg:sp?.af||null,simRank};
-        }).sort((a,b)=>a.finish-b.finish);
-
-        const unmatched=gradeResults.filter(r=>!simMap[r.pid]&&!simMap[normName(r.name)]&&!simMap[lastFirst(r.name)]&&r.finish<=20).sort((a,b)=>a.finish-b.finish);
-
+        /* Use allPlayers (150) if available, fall back to top30 */
+        const simRoster=gradingSim.allPlayers||gradingSim.top30||[];
+        const simMap=buildGradeMap(simRoster);
+        /* Three-pass match and rank comparison */
+        const simRanked=simRoster.slice().sort((a,b)=>(b.w||0)-(a.w||0));
+        const simRankById={};simRanked.forEach((p,i)=>{if(p.id)simRankById[p.id]=i+1;simRankById[normName(p.n)]=i+1;});
+        const matched=[];const unmatched=[];
+        gradeResults.forEach(r=>{const sp=gradeMatchPlayer(r,simMap);if(sp){const simRank=(r.pid&&simRankById[r.pid])||simRankById[normName(r.name)]||null;matched.push({name:r.name,finish:r.finish,simWin:sp.w||0,simT5:sp.t5||0,simT10:sp.t10||0,simT20:sp.t20||0,avgFinish:sp.af||null,simRank,delta:simRank?r.finish-simRank:null});}else if(r.finish<=20){unmatched.push(r);}});
+        matched.sort((a,b)=>a.finish-b.finish);
         const corr=matched.length>=5?spearmanCorr(matched.map(m=>m.simWin),matched.map(m=>m.finish)):null;
-        const rankCorr=matched.length>=5?spearmanCorr(matched.map(m=>m.simRank==="—"?999:m.simRank),matched.map(m=>m.finish)):null;
-        const best=matched.filter(m=>m.simWin>0.005&&m.finish<=10).sort((a,b)=>b.simWin-a.simWin).slice(0,5);
-        const worst=matched.filter(m=>m.simWin>0.01&&m.finish>40).sort((a,b)=>b.simWin-a.simWin).slice(0,5);
-        const surprises=matched.filter(m=>m.finish<=10&&m.simWin<0.005).sort((a,b)=>a.finish-b.finish).slice(0,5);
-        const busts=matched.filter(m=>m.simRank!=="—"&&m.simRank<=15&&m.finish>40).sort((a,b)=>a.simRank-b.simRank).slice(0,5);
-
-        return<div style={S.section}><h3 style={S.h3}>📊 Projection vs Actual</h3>
-          {/* Score Cards */}
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:12,marginBottom:16}}>
-            {corr!=null&&<div style={{padding:12,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Win% → Finish Correlation</div><div style={{fontSize:22,fontWeight:700,color:corr<-0.3?"#22c55e":corr<-0.1?"#f59e0b":"#ef4444"}}>{corr.toFixed(3)}</div><div style={{fontSize:9,color:"#475569"}}>{corr<-0.4?"Excellent model":corr<-0.25?"Good model":corr<-0.1?"Okay — room to improve":"Weak — review weights"}</div></div>}
-            {rankCorr!=null&&<div style={{padding:12,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Sim Rank → Finish Rank</div><div style={{fontSize:22,fontWeight:700,color:rankCorr>0.3?"#22c55e":rankCorr>0.1?"#f59e0b":"#ef4444"}}>{rankCorr.toFixed(3)}</div><div style={{fontSize:9,color:"#475569"}}>{matched.length} matched</div></div>}
-            <div style={{padding:12,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Coverage</div><div style={{fontSize:22,fontWeight:700,color:"#e2e8f0"}}>{matched.length}<span style={{fontSize:12,color:"#475569"}}>/{gradeResults.length}</span></div><div style={{fontSize:9,color:"#475569"}}>{simPlayers.length} in sim · {unmatched.length} top-20 unmatched</div></div>
+        const rankCorr=matched.filter(m=>m.simRank).length>=5?spearmanCorr(matched.filter(m=>m.simRank).map(m=>m.simRank),matched.filter(m=>m.simRank).map(m=>m.finish)):null;
+        /* Best calls: high sim prob + actual top finish */
+        const bestCalls=matched.filter(m=>m.simWin>0.02&&m.finish<=10).sort((a,b)=>b.simWin-a.simWin).slice(0,5);
+        /* Worst calls: high sim prob, bad finish */
+        const worstCalls=matched.filter(m=>m.simWin>0.02&&m.finish>40).sort((a,b)=>b.simWin-a.simWin).slice(0,5);
+        /* Surprises: low sim rank but top 10 finish */
+        const surprises=matched.filter(m=>m.simRank&&m.simRank>30&&m.finish<=10).sort((a,b)=>a.finish-b.finish).slice(0,5);
+        /* Busts: top 15 sim rank but missed cut or bottom half */
+        const busts=matched.filter(m=>m.simRank&&m.simRank<=15&&m.finish>=50).sort((a,b)=>a.simRank-b.simRank).slice(0,5);
+        const hitT5=matched.filter(m=>m.finish<=5).length;const simT5Mass=matched.filter(m=>m.finish<=5).reduce((s,m)=>s+m.simT5,0);
+        const hitT20=matched.filter(m=>m.finish<=20).length;
+        return<div style={S.section}><h3 style={S.h3}>📊 Scorecard</h3>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:8,marginBottom:14}}>
+            <div style={{padding:10,background:"#0f172a",borderRadius:5,border:"1px solid #1e293b"}}><div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Win% Rank Corr</div><div style={{fontSize:18,fontWeight:700,color:corr!=null&&corr<-0.3?"#22c55e":corr!=null&&corr<-0.1?"#f59e0b":"#ef4444"}}>{corr!=null?corr.toFixed(3):"—"}</div><div style={{fontSize:9,color:"#475569"}}>{corr!=null?(corr<-0.4?"Excellent":corr<-0.25?"Good":corr<-0.1?"Okay":"Weak"):""}</div></div>
+            <div style={{padding:10,background:"#0f172a",borderRadius:5,border:"1px solid #1e293b"}}><div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Sim→Finish Rank Corr</div><div style={{fontSize:18,fontWeight:700,color:rankCorr!=null&&rankCorr>0.3?"#22c55e":rankCorr!=null&&rankCorr>0.1?"#f59e0b":"#ef4444"}}>{rankCorr!=null?rankCorr.toFixed(3):"—"}</div></div>
+            <div style={{padding:10,background:"#0f172a",borderRadius:5,border:"1px solid #1e293b"}}><div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Top 5 Captured</div><div style={{fontSize:18,fontWeight:700,color:"#22d3ee"}}>{hitT5}/5</div><div style={{fontSize:9,color:"#475569"}}>Sim T5 mass: {pFmtS(simT5Mass)}</div></div>
+            <div style={{padding:10,background:"#0f172a",borderRadius:5,border:"1px solid #1e293b"}}><div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Matched Players</div><div style={{fontSize:18,fontWeight:700,color:"#cbd5e1"}}>{matched.length}</div><div style={{fontSize:9,color:"#475569"}}>{unmatched.length} unmatched T20</div></div>
           </div>
-
-          {/* Best/Worst/Surprise/Bust panels */}
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:12,marginBottom:16}}>
-            {best.length>0&&<div style={{padding:10,background:"#0a2e1a",border:"1px solid #166534",borderRadius:6}}><div style={{fontSize:9,fontWeight:700,color:"#22c55e",marginBottom:4,textTransform:"uppercase"}}>Best Calls ({best.length})</div>{best.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1",marginBottom:2}}>{m.name}: <span style={{color:"#22c55e"}}>Win {pFmtS(m.simWin)}</span> → <b>#{m.finish}</b></div>)}</div>}
-            {worst.length>0&&<div style={{padding:10,background:"#1c1117",border:"1px solid #7f1d1d",borderRadius:6}}><div style={{fontSize:9,fontWeight:700,color:"#ef4444",marginBottom:4,textTransform:"uppercase"}}>Worst Calls ({worst.length})</div>{worst.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1",marginBottom:2}}>{m.name}: <span style={{color:"#ef4444"}}>Win {pFmtS(m.simWin)}</span> → #{m.finish}</div>)}</div>}
-            {surprises.length>0&&<div style={{padding:10,background:"#1a1a0e",border:"1px solid #854d0e",borderRadius:6}}><div style={{fontSize:9,fontWeight:700,color:"#f59e0b",marginBottom:4,textTransform:"uppercase"}}>Surprises (Top 10, Low Sim%)</div>{surprises.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1",marginBottom:2}}>{m.name}: Win {pFmtS(m.simWin)} → <b style={{color:"#f59e0b"}}>#{m.finish}</b></div>)}</div>}
-            {busts.length>0&&<div style={{padding:10,background:"#1c1117",border:"1px solid #7f1d1d",borderRadius:6}}><div style={{fontSize:9,fontWeight:700,color:"#f87171",marginBottom:4,textTransform:"uppercase"}}>Busts (Top 15 Sim, Finish 40+)</div>{busts.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1",marginBottom:2}}>{m.name}: <span style={{color:"#f87171"}}>Sim #{m.simRank}</span> → #{m.finish}</div>)}</div>}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
+            {bestCalls.length>0&&<div style={{padding:10,background:"#0a2e1a",borderRadius:5,border:"1px solid #166534"}}><div style={{fontSize:10,fontWeight:700,color:"#22c55e",marginBottom:5}}>✓ BEST CALLS</div>{bestCalls.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1",padding:"2px 0"}}>{m.name}: {pFmtS(m.simWin)} → <b>#{m.finish}</b></div>)}</div>}
+            {worstCalls.length>0&&<div style={{padding:10,background:"#1c1117",borderRadius:5,border:"1px solid #7f1d1d"}}><div style={{fontSize:10,fontWeight:700,color:"#ef4444",marginBottom:5}}>✗ WORST CALLS</div>{worstCalls.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1",padding:"2px 0"}}>{m.name}: {pFmtS(m.simWin)} → <b>#{m.finish}</b></div>)}</div>}
+            {surprises.length>0&&<div style={{padding:10,background:"#1a1a0e",borderRadius:5,border:"1px solid #854d0e"}}><div style={{fontSize:10,fontWeight:700,color:"#f59e0b",marginBottom:5}}>⚡ SURPRISES (low sim rank, top 10)</div>{surprises.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1",padding:"2px 0"}}>{m.name}: sim #{m.simRank} → <b>#{m.finish}</b></div>)}</div>}
+            {busts.length>0&&<div style={{padding:10,background:"#0f0f1a",borderRadius:5,border:"1px solid #3730a3"}}><div style={{fontSize:10,fontWeight:700,color:"#a78bfa",marginBottom:5}}>💤 BUSTS (top 15 sim, bottom half)</div>{busts.map(m=><div key={m.name} style={{fontSize:10,color:"#cbd5e1",padding:"2px 0"}}>{m.name}: sim #{m.simRank} → <b>#{m.finish}</b></div>)}</div>}
           </div>
-
-          {/* Unmatched actual top finishers */}
-          {unmatched.length>0&&<div style={{padding:10,background:"#0f172a",border:"1px solid #334155",borderRadius:6,marginBottom:16}}><div style={{fontSize:9,fontWeight:700,color:"#f59e0b",marginBottom:4,textTransform:"uppercase"}}>Unmatched Top-20 Finishers (not in sim)</div><div style={{display:"flex",flexWrap:"wrap",gap:4}}>{unmatched.map(m=><span key={m.name} style={{fontSize:10,padding:"2px 6px",background:"#1e293b",borderRadius:3,color:"#cbd5e1"}}>#{m.finish} {m.name}</span>)}</div></div>}
-
-          {/* Full table */}
-          <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>Finish</th><th style={{...S.th,textAlign:"left"}}>Player</th><th style={{...S.th,color:"#22d3ee"}}>Sim Rank</th><th style={S.th}>Sim Win%</th><th style={S.th}>Sim T5%</th><th style={S.th}>Sim T10%</th><th style={S.th}>Sim T20%</th><th style={S.th}>Sim Cut%</th>{simPlayers[0]?.af!=null&&<th style={S.th}>Sim Avg</th>}</tr></thead><tbody>
-            {matched.slice(0,showAll?999:80).map((m,i)=>{const rankDelta=m.simRank!=="—"?m.simRank-m.finish:null;return(<tr key={m.name} style={i%2?S.trO:S.trE}><td style={{...S.td,fontWeight:700,color:m.finish<=5?"#22c55e":m.finish<=20?"#22d3ee":"#94a3b8"}}>{m.finish}</td><td style={S.tdN}>{m.name}</td><td style={{...S.td,color:rankDelta!=null?(Math.abs(rankDelta)<=5?"#22c55e":Math.abs(rankDelta)<=15?"#f59e0b":"#ef4444"):"#475569"}}>{m.simRank}{rankDelta!=null&&<span style={{fontSize:8,marginLeft:3,color:rankDelta>0?"#ef4444":"#22c55e"}}>{rankDelta>0?"↓"+rankDelta:rankDelta<0?"↑"+Math.abs(rankDelta):""}</span>}</td><td style={S.td}>{pFmtS(m.simWin)}</td><td style={S.td}>{pFmtS(m.simT5)}</td><td style={S.td}>{pFmtS(m.simT10)}</td><td style={S.td}>{pFmtS(m.simT20)}</td><td style={S.td}>{pFmtS(m.simMC)}</td>{simPlayers[0]?.af!=null&&<td style={S.td}>{m.simAvg?.toFixed(1)||"—"}</td>}</tr>);})}
+          {unmatched.length>0&&<div style={{marginBottom:14,padding:10,background:"#0f172a",borderRadius:5,border:"1px solid #334155"}}><div style={{fontSize:10,fontWeight:700,color:"#94a3b8",marginBottom:5}}>⚠ UNMATCHED TOP 20 (not in sim roster)</div><div style={{fontSize:10,color:"#cbd5e1",display:"flex",flexWrap:"wrap",gap:8}}>{unmatched.slice(0,20).map(r=><span key={r.name||r.pid}>{r.name} #{r.finish}</span>)}</div></div>}
+          <h3 style={S.h3}>Full Results</h3>
+          <div style={S.tW}><table style={S.table}><thead><tr><th style={S.th}>Finish</th><th style={{...S.th,textAlign:"left"}}>Player</th><th style={S.th}>Sim Rank</th><th style={S.th}>Δ</th><th style={S.th}>Sim Win%</th><th style={S.th}>Sim T5%</th><th style={S.th}>Sim T20%</th><th style={S.th}>Sim Avg Pos</th></tr></thead><tbody>
+            {matched.slice(0,150).map((m,i)=>(<tr key={m.name} style={i%2?S.trO:S.trE}><td style={{...S.td,fontWeight:700,color:m.finish<=5?"#22c55e":m.finish<=20?"#22d3ee":"#94a3b8"}}>{m.finish}</td><td style={S.tdN}>{m.name}</td><td style={S.td}>{m.simRank||"-"}</td><td style={{...S.td,color:m.delta==null?"#475569":m.delta>10?"#22c55e":m.delta<-10?"#ef4444":"#94a3b8"}}>{m.delta==null?"-":(m.delta>0?"+":"")+m.delta}</td><td style={S.td}>{pFmtS(m.simWin)}</td><td style={S.td}>{pFmtS(m.simT5)}</td><td style={S.td}>{pFmtS(m.simT20)}</td><td style={S.tdD}>{m.avgFinish!=null?m.avgFinish.toFixed(1):"-"}</td></tr>))}
           </tbody></table></div>
-          {!showAll&&matched.length>80&&<button onClick={()=>setShowAll(true)} style={{...S.btnSm,marginTop:8}}>Show All {matched.length}</button>}
-        </div>;})()}
+        </div>;
+      })()}
 
-      {/* ── What Actually Mattered ── */}
       {gradeCorr&&<div style={S.section}><h3 style={S.h3}>🎯 What Actually Mattered</h3>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:18}}>
-          <div style={{padding:14,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}><div style={{fontSize:12,fontWeight:700,color:"#f59e0b",marginBottom:8}}>Actual SG Importance (n={gradeCorr.n})</div>
-            {gradeCorr.corrs.map(c=>{const yourW=gradingSim?gradingSim.sg?.[c.sk==="dist"?"dist":c.sk==="app"?"app":c.sk==="arg"?"arg":"putt"]||0:null;const delta=yourW!=null?c.suggestedPct-yourW:null;return(<div key={c.k} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:"1px solid #1e293b"}}><span style={{fontSize:11,color:"#cbd5e1"}}>{c.l}</span><div style={{display:"flex",gap:8,alignItems:"center"}}><span style={{fontSize:13,fontWeight:700,color:"#f59e0b"}}>{c.suggestedPct}%</span>{yourW!=null&&<span style={{fontSize:10,color:Math.abs(delta)<=5?"#22c55e":Math.abs(delta)<=12?"#f59e0b":"#ef4444"}}>you: {yourW}% ({delta>0?"+":""}{delta})</span>}<span style={{fontSize:9,color:"#475569"}}>r={c.corr?.toFixed(2)}</span></div></div>);})}
+          <div style={{padding:14,background:"#0f172a",borderRadius:6,border:"1px solid #1e293b"}}>
+            <div style={{fontSize:12,fontWeight:700,color:"#f59e0b",marginBottom:8}}>Actual SG Importance (n={gradeCorr.n})</div>
+            {gradeCorr.corrs.map(c=>(<div key={c.k} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid #1e293b"}}><span style={{fontSize:11,color:"#cbd5e1"}}>{c.l}</span><div><span style={{fontSize:13,fontWeight:700,color:"#f59e0b"}}>{c.suggestedPct}%</span><span style={{fontSize:9,color:"#475569",marginLeft:6}}>r={c.corr?.toFixed(2)}</span></div></div>))}
             {gradingSim&&<div style={{marginTop:12,fontSize:10,color:"#64748b"}}><b>Your weights:</b> D:{gradingSim.sg?.dist}% Ac:{gradingSim.sg?.acc}% Ap:{gradingSim.sg?.app}% AR:{gradingSim.sg?.arg}% P:{gradingSim.sg?.putt}%</div>}
+            <button onClick={()=>{const ott=gradeCorr.corrs.find(c=>c.k==="sg_ott")?.suggestedPct||25;const d=Math.round(ott*OTT_DIST_RATIO);const a=ott-d;const app=gradeCorr.corrs.find(c=>c.k==="sg_app")?.suggestedPct||25;const arg=gradeCorr.corrs.find(c=>c.k==="sg_arg")?.suggestedPct||25;const putt=gradeCorr.corrs.find(c=>c.k==="sg_putt")?.suggestedPct||25;const tot=d+a+app+arg+putt;const adj=100-tot;setSgW({dist:d,acc:a,app:app+adj,arg,putt});setTab("simulation");}} style={{...S.btnSm,marginTop:10,background:"#22c55e"}}>Apply These Weights →</button>
           </div>
           <div style={{fontSize:11,color:"#64748b",lineHeight:1.6,padding:"14px 0"}}>
             <p>These weights show which SG categories most strongly correlated with finish position at this event.</p>
-            <p style={{marginTop:8}}>Compare the <b style={{color:"#f59e0b"}}>optimal %</b> against <b>your weights</b>. Green = close match, red = significant gap. Use this to calibrate weights for similar courses.</p>
-            {gradingSim&&<button onClick={()=>{if(!gradeCorr)return;const corrs=gradeCorr.corrs;const abs=corrs.map(c=>Math.abs(c.corr));const tot=abs.reduce((a,b)=>a+b,0)||1;const ott=Math.round(abs[0]/tot*100);setSgW({dist:Math.round(ott*OTT_DIST_RATIO),acc:ott-Math.round(ott*OTT_DIST_RATIO),app:corrs[1]?.suggestedPct||25,arg:corrs[2]?.suggestedPct||25,putt:corrs[3]?.suggestedPct||25});setTab("simulation");}} style={{...S.btnSm,marginTop:12,background:"#f59e0b",color:"#0a0e17"}}>Apply These Weights →</button>}
+            <p style={{marginTop:8}}>A higher % means that category was more predictive. Compare against the weights you used to see where your model was over/under-weighted.</p>
+            <p style={{marginTop:8,color:"#475569",fontStyle:"italic"}}>"Apply These Weights" updates only SG weights, not context multipliers.</p>
           </div>
-        </div>
-      </div>}
+        </div></div>}
 
-      {/* ── localStorage Backup ── */}
-      <div style={S.section}><h3 style={S.h3}>💾 Data Backup</h3>
-        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}><button onClick={()=>{const data={};for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k.startsWith("pga3_"))data[k]=localStorage.getItem(k);}const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([JSON.stringify(data)],{type:"application/json"}));a.download="pga3_backup_"+new Date().toISOString().slice(0,10)+".json";a.click();}} style={{...S.btnSm,background:"#1e293b",color:"#94a3b8"}}>⬇ Export All Data</button>
-          <label style={{...S.btnSm,background:"#1e293b",color:"#94a3b8",cursor:"pointer"}}>⬆ Import Backup<input type="file" accept=".json" style={{display:"none"}} onChange={e=>{const file=e.target.files?.[0];if(!file)return;const reader=new FileReader();reader.onload=ev=>{try{const data=JSON.parse(ev.target.result);let count=0;Object.entries(data).forEach(([k,v])=>{if(k.startsWith("pga3_")){localStorage.setItem(k,v);count++;}});alert("Restored "+count+" keys. Refresh to apply.");location.reload();}catch(err){alert("Invalid backup: "+err.message);}};reader.readAsText(file);}}/></label>
+      <div style={{...S.dv,margin:"22px 0"}}/>
+      <div style={S.section}><h3 style={S.h3}>💾 Backup &amp; Restore</h3>
+        <div style={{fontSize:10,color:"#64748b",marginBottom:8}}>Export all local data (sim history, weights, presets, keys) as JSON. Restore on a different browser or after clearing data.</div>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          <button onClick={()=>{const data={};for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k.startsWith("pga3_"))data[k]=localStorage.getItem(k);}const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="pga3_backup_"+new Date().toISOString().slice(0,10)+".json";a.click();}} style={S.btnSm}>⬇ Export Backup</button>
+          <label style={{...S.btnSm,cursor:"pointer",display:"inline-block"}}>⬆ Import Backup<input type="file" accept=".json" style={{display:"none"}} onChange={e=>{const f=e.target.files?.[0];if(!f)return;const r=new FileReader();r.onload=ev=>{try{const data=JSON.parse(ev.target.result);let count=0;Object.entries(data).forEach(([k,v])=>{if(k.startsWith("pga3_")){localStorage.setItem(k,v);count++;}});alert("Restored "+count+" items. Reload the page to see changes.");}catch(err){alert("Import failed: "+err.message);}};r.readAsText(f);}}/></label>
         </div>
-        <div style={{fontSize:9,color:"#475569",marginTop:4}}>Export saves all simulation history, weights, presets, and course data.</div>
       </div>
     </div>}
   </div>);
